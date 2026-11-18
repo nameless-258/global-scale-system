@@ -1,0 +1,6 @@
+# Material criptográfico é gerado localmente — NUNCA é versionado
+certs/
+__pycache__/
+*.pyc
+.venv/
+*.class

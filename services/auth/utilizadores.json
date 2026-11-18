@@ -1,0 +1,37 @@
+{
+  "ana": {
+    "nome": "Ana Machava",
+    "papel": "cliente",
+    "salt": "d6b576749d488da5c31b89f47163ef0d",
+    "iteracoes": 310000,
+    "hash": "b54b80aef68c1efbf46e31f6e64832a84d2a91856bb44a70bd8560162e1dde88"
+  },
+  "carla": {
+    "nome": "Carla Sitoe",
+    "papel": "cliente",
+    "salt": "730c563255a50f16c6f8a57ad4272de8",
+    "iteracoes": 310000,
+    "hash": "57124729ff423ffa6ece3b86c0aaec2458e5828f3ea84438ff5f8798242fa9a7"
+  },
+  "bruno": {
+    "nome": "Bruno Cossa",
+    "papel": "cliente",
+    "salt": "99cd150008a756116408d5595467cf62",
+    "iteracoes": 310000,
+    "hash": "bfa39e7646dd0e2dff9ba438a7944528a0b236092ef69fb231dc176f3085043c"
+  },
+  "diego": {
+    "nome": "Diego Mondlane",
+    "papel": "cliente",
+    "salt": "5f7d509607fc78a7c571d0c423d98772",
+    "iteracoes": 310000,
+    "hash": "a70ad3557f752245931dbd24c80742639012a2d9b9705feb235804c1db50b3d5"
+  },
+  "admin": {
+    "nome": "Administrador",
+    "papel": "admin",
+    "salt": "b38a6aa1bc539b2a5cf90469467ce4ad",
+    "iteracoes": 310000,
+    "hash": "423b9944147594ca36b75115011dc744d0a82e951eb44ba60a62d5d0cc21b11c"
+  }
+}
