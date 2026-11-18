@@ -1,0 +1,48 @@
+digraph G {
+  graph [rankdir=TB, newrank=true, splines=spline, concentrate=false, fontname="Helvetica", fontsize=12, nodesep=0.35, ranksep=0.55, pad=0.3, bgcolor="white",
+         label="Global-Scale System — Arquitetura Distribuída (rede Docker global-net 172.28.0.0/24)", labelloc=t, fontsize=16];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, color="#555555"];
+  edge  [fontname="Helvetica", fontsize=8, color="#555555"];
+
+  cliente [label="Cliente\n(cliente.py / browser)\nSHA-256 de cada transação", fillcolor="#eeeeee"];
+  gateway [label="gateway (Nginx)\n172.28.0.10  :443 → host :8443\nTLS + balanceamento round-robin", fillcolor="#fde2b8"];
+
+  subgraph cluster_app { label="Camada de Serviços Web (REST/JSON sobre HTTPS)"; style="rounded,dashed"; color="#888888";
+    auth  [label="auth (Python)\n172.28.0.11 :8443\nEmissor JWT RS256\n(chave PRIVADA)", fillcolor="#d7e8fb"];
+    api1  [label="api-1 (Python/FastAPI)\n172.28.0.21 :8443\nCoordenador 2PC / Saga\nvalida JWT localmente", fillcolor="#cfe9d4"];
+    api2  [label="api-2 (Python/FastAPI)\n172.28.0.22 :8443\nCoordenador 2PC / Saga\nvalida JWT localmente", fillcolor="#cfe9d4"];
+    wal   [label="WAL do coordenador\n(volume coordenador-data)", shape=cylinder, fillcolor="#f4f4f4"];
+  }
+
+  subgraph cluster_db { label="BD Distribuída (PostgreSQL 16)\nfragmentação horizontal\nacesso via 2PC · TLS verify-full"; style="rounded,dashed"; color="#888888";
+    dbeu [label="db-europa — Nó A\n172.28.0.41 :5432\ncontas EU-*", shape=cylinder, fillcolor="#e5d8f5"];
+    dbam [label="db-america — Nó B\n172.28.0.42 :5432\ncontas AM-*", shape=cylinder, fillcolor="#e5d8f5"];
+  }
+
+  subgraph cluster_dfs { label="DFS — HDFS (replicação = 2)"; style="rounded,dashed"; color="#888888";
+    nn  [label="namenode\n172.28.0.51 :9870/8020\nmetadados + leases", fillcolor="#fff3b0"];
+    dn1 [label="datanode-1\n172.28.0.52 :9864\nblocos", fillcolor="#fff9d6"];
+    dn2 [label="datanode-2\n172.28.0.53 :9864\nblocos", fillcolor="#fff9d6"];
+  }
+
+  legacy [label="legacy (Java 21)\n172.28.0.31 :8443\n\"Mainframe\" do banco parceiro\nXML + assinatura SHA256withRSA", fillcolor="#f8d0d0"];
+
+  cliente -> gateway [label="HTTPS (TLS 1.3)\nBearer JWT"];
+  gateway -> auth   [label="HTTPS /auth/*"];
+  gateway -> api1   [label="HTTPS"];
+  gateway -> api2   [label="HTTPS"];
+  auth -> api1 [style=dotted, label="chave PÚBLICA\n(JWKS)", arrowhead=none];
+  auth -> api2 [style=dotted, arrowhead=none];
+  {rank=same; wal; api1; api2;}
+  wal -> api1 [style=invis];
+  api1 -> wal [style=dashed, arrowhead=none, label="fsync"]; api2 -> wal [style=dashed, arrowhead=none, constraint=false];
+  {rank=same; dbeu; dbam; nn; legacy;}
+  {rank=same; dn1; dn2;}
+  api1 -> dbeu; api1 -> dbam;
+  api2 -> dbeu; api2 -> dbam;
+  api1 -> legacy [color="#c0392b"];
+  api2 -> legacy [color="#c0392b", xlabel="SAGA · XML assinado"];
+  api1 -> nn; api2 -> nn [xlabel="WebHDFS"];
+  nn -> dn1 [label="307"]; nn -> dn2;
+  dn1 -> dn2 [dir=both, style=dashed, label="replicação"];
+}
