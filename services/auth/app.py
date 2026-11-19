@@ -20,8 +20,8 @@ from cryptography.hazmat.primitives import serialization
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-PRIVATE_KEY = Path(os.getenv("JWT_PRIVATE_KEY", "/certs/jwt-private.pem")).read_text()
-PUBLIC_KEY = Path(os.getenv("JWT_PUBLIC_KEY", "/certs/jwt-public.pem")).read_text()
+PRIVATE_KEY = Path(os.getenv("JWT_PRIVATE_KEY", "/certs/privado/jwt-private.pem")).read_text()
+PUBLIC_KEY = Path(os.getenv("JWT_PUBLIC_KEY", "/certs/publico/jwt-public.pem")).read_text()
 ISSUER = os.getenv("JWT_ISSUER", "global-scale-auth")
 AUDIENCE = os.getenv("JWT_AUDIENCE", "global-scale-api")
 TTL = int(os.getenv("JWT_TTL_SEGUNDOS", "900"))

@@ -5,4 +5,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py utilizadores.json ./
 EXPOSE 8443
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8443", "--ssl-keyfile", "/certs/auth.key", "--ssl-certfile", "/certs/auth.crt"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8443", "--ssl-keyfile", "/certs/privado/tls.key", "--ssl-certfile", "/certs/privado/tls.crt"]

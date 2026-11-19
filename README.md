@@ -16,6 +16,8 @@ Projeto prático do Exame Laboratorial da disciplina **Sistemas Distribuídos e 
 | `api-1`, `api-2` | Python / FastAPI | 172.28.0.21/22 :8443 | Núcleo REST/JSON e coordenadores de **2PC** e **Saga** |
 | `db-europa` | PostgreSQL 16 | 172.28.0.41 :5432 | Fragmento A, com as contas `EU-*` |
 | `db-america` | PostgreSQL 16 | 172.28.0.42 :5432 | Fragmento B, com as contas `AM-*` |
+| `db-europa-r`, `db-america-r` | PostgreSQL 16 | 172.28.0.43/44 :5432 | **Réplicas síncronas** (streaming sobre TLS) de cada fragmento |
+| `sentinela` | Python | 172.28.0.45 | Vigia os primários, gere o modo síncrono e faz **failover automático** com *fencing* |
 | `namenode` | Hadoop HDFS 3.3.6 | 172.28.0.51 · host **:9870** | Metadados do DFS |
 | `datanode-1/2` | Hadoop HDFS 3.3.6 | 172.28.0.52/53 | Blocos do DFS, com replicação = 2 |
 | `legacy` | **Java 21** | 172.28.0.31 :8443 | "Mainframe" do banco parceiro: XML com assinatura digital |
@@ -35,13 +37,13 @@ docker compose up -d --build        # 1.ª vez: 3–6 min (descarrega imagens)
 docker compose ps                   # todos "running" / "healthy"
 ```
 
-O serviço `certs` gera automaticamente a PKI em `./certs`: a CA, os certificados de cada serviço, as chaves JWT e as chaves de assinatura. Esta pasta **não é versionada**.
+O serviço `certs` gera automaticamente, numa instalação nova, todos os segredos em `./certs`: a CA, os certificados de cada serviço, as chaves JWT e de assinatura, a chave AES de cifragem dos dados e **palavras-passe aleatórias** para a base de dados. Cada serviço só monta a sua pasta (`certs/<serviço>` → `/certs/privado`) e a pasta comum `certs/publico`. Esta pasta **não é versionada**.
 
 > Espere cerca de **60 segundos** depois do arranque para o HDFS sair do *safe mode*. Até lá, os registos de auditoria ficam guardados em memória e são enviados automaticamente quando o HDFS estiver pronto.
 
 Interfaces disponíveis:
 
-- **API (Swagger):** https://localhost:8443/docs. O certificado é da CA própria; pode importar `certs/ca.crt` no browser ou aceitar o aviso.
+- **API (Swagger):** https://localhost:8443/docs. O certificado é da CA própria; pode importar `certs/publico/ca.crt` no browser ou aceitar o aviso.
 - **HDFS:** http://localhost:9870, em *Datanodes* e em *Utilities → Browse the file system*.
 
 ## Utilizadores de demonstração
@@ -53,6 +55,14 @@ Interfaces disponíveis:
 | bruno | `Bruno@2026` | cliente | AM-2001 (USD) |
 | diego | `Diego@2026` | cliente | AM-2002 (MZN) |
 | admin | `Admin@2026` | admin | todas |
+
+### Alta disponibilidade e segurança dos dados
+
+- **Réplica síncrona por fragmento:** cada `COMMIT` (e cada `PREPARE TRANSACTION` do 2PC) só é confirmado depois de gravado também na réplica, por isso um failover não perde transações confirmadas (RPO = 0).
+- **Failover automático:** a `sentinela` verifica os primários a cada 2 s. À 3.ª falha seguida veda o antigo primário (marca no volume `fencing`) e promove a réplica. A API usa `target_session_attrs=read-write` com os dois hosts, e passa sozinha para o novo primário.
+- **Recuperação por outra réplica:** o WAL dos coordenadores está num volume partilhado. Se a `api-1` morrer de vez a meio do 2PC, a `api-2` lê a decisão e conclui as transações preparadas.
+- **Cifragem em repouso:** os nomes dos titulares e das contrapartes são cifrados na aplicação com **AES-256-GCM** (com o contexto da linha como dados associados). A base de dados e as réplicas só guardam bytes cifrados.
+- **Mainframe persistente:** as ordens aceites pelo legado Java ficam num registo em disco e são recarregadas no arranque.
 
 ### Moedas e câmbio
 
@@ -85,9 +95,9 @@ gss admin-2pc                                     # estado do coordenador e tran
 Exemplo com `curl`:
 
 ```bash
-TOKEN=$(curl -s --cacert certs/ca.crt https://localhost:8443/auth/login \
+TOKEN=$(curl -s --cacert certs/publico/ca.crt https://localhost:8443/auth/login \
   -H 'Content-Type: application/json' -d '{"username":"ana","password":"Ana@2026"}' | jq -r .access_token)
-curl -s --cacert certs/ca.crt https://localhost:8443/contas -H "Authorization: Bearer $TOKEN" | jq
+curl -s --cacert certs/publico/ca.crt https://localhost:8443/contas -H "Authorization: Bearer $TOKEN" | jq
 ```
 
 ## Simulação de falhas (demonstração laboratorial)
@@ -104,6 +114,19 @@ O guião completo, passo a passo, está em `bash scripts/demo.sh`. Os cenários 
 | Nó em baixo ao atualizar uma taxa | `docker compose stop db-america`, depois `gss taxa-atualizar EUR 99` | ABORT; **nenhuma** réplica é alterada |
 | Legado em baixo | `docker compose stop legacy`, depois `gss ordem ...` | A Saga executa a **compensação** (estorno) |
 | DataNode em baixo | `docker compose stop datanode-1` | Os ficheiros continuam legíveis, graças à réplica no `datanode-2` |
+| Primário morre na fase 2 | `gss transferir EU-1002 AM-2002 100 --falha atraso_fase2` e, durante a espera, `docker compose stop db-america` | A sentinela promove `db-america-r` e a recuperação faz `COMMIT PREPARED` no novo primário |
+| Antigo primário volta | `docker compose start db-america` | Fica **vedado** (não arranca como primário): sem *split-brain* |
+| Coordenador morre de vez | `gss transferir ... --falha crash_permanente_coordenador` (enviado à `api-1`) | A `api-2` assume e conclui a transação a partir do WAL da `api-1` |
+
+Depois dos cenários de failover, reponha a topologia inicial com `bash scripts/reset-alta-disponibilidade.sh`.
+
+## Testes automáticos
+
+```bash
+docker compose run --rm -T --entrypoint python cliente /scripts/testes.py
+```
+
+São 23 testes: autenticação, cifragem, 2PC local e distribuído, conservação do valor, saldo insuficiente, falha na fase 1, autorização, integridade, replay, mensagens expiradas, taxas replicadas, Saga (sucesso e compensação), HDFS, auditoria, concorrência sem deadlocks e estado das réplicas.
 
 Para consultar os saldos e as transações preparadas diretamente nos nós:
 
@@ -126,13 +149,17 @@ docker compose exec db-america psql -U postgres -d banco -c "select gid, prepare
 │   │   ├── transacoes.py       Coordenador 2PC, Saga e recuperação
 │   │   ├── shards.py           Encaminhamento para fragmentos e scatter-gather
 │   │   ├── security.py         JWT, SHA-256 e assinatura digital
+│   │   ├── cripto.py           Cifragem em repouso AES-256-GCM
+│   │   ├── sentinela.py        Vigilância, failover e fencing das réplicas
 │   │   ├── dfs.py              Cliente WebHDFS e auditoria encadeada
 │   │   └── legado.py           Adaptador JSON <-> XML para o mainframe
 │   └── legacy-java/            Mainframe do banco parceiro (Java 21)
 ├── scripts/
-│   ├── gen-certs.sh            PKI (CA e certificados)
+│   ├── gen-certs.sh            PKI e segredos por serviço
 │   ├── cliente.py              Cliente de linha de comandos
-│   └── demo.sh                 Guião da demonstração
+│   ├── testes.py               23 testes automáticos
+│   ├── reset-alta-disponibilidade.sh  Repõe primários e réplicas
+│   └── demo.sh                 Guião da demonstração (17 passos)
 └── docs/arquitetura.(png|svg|dot)
 ```
 

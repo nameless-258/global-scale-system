@@ -1,47 +1,59 @@
-"""Configuração do nó da aplicação (lida de variáveis de ambiente).
+"""Configuração do nó da aplicação (lida de variáveis de ambiente e de segredos).
 
 Cada réplica da API (api-1, api-2) corre exatamente o mesmo código; apenas o
 NODE_ID muda. Isto é a base da replicação ativa da camada aplicacional.
+
+Segredos (palavra-passe da BD, chave de cifragem de dados, chave de assinatura)
+são lidos de ficheiros montados SÓ neste contentor (/certs/privado), nunca de
+variáveis no docker-compose.yml nem do código-fonte.
 """
 import os
 from pathlib import Path
 
 NODE_ID = os.getenv("NODE_ID", "api-1")
+# Réplicas da API que partilham o volume do registo do coordenador (ver recuperação)
+PEERS = [p.strip() for p in os.getenv("PEERS", "api-1,api-2").split(",") if p.strip()]
+PEER_PORTA = int(os.getenv("PEER_PORTA", "8443"))
+# Endereço de cada réplica (por omissão <nome>:8443); ex: "api-1=localhost:9101,api-2=localhost:9102"
+PEER_ENDERECOS = dict(e.split("=", 1) for e in os.getenv("PEER_ENDERECOS", "").split(",") if "=" in e)
+
+PUBLICO = Path(os.getenv("CERTS_PUBLICO", "/certs/publico"))
+PRIVADO = Path(os.getenv("CERTS_PRIVADO", "/certs/privado"))
+CA_CERT = str(PUBLICO / "ca.crt")
+
+
+def _segredo(nome: str, env: str | None = None) -> str:
+    if env and os.getenv(env):
+        return os.environ[env]
+    return (PRIVADO / nome).read_text().strip()
+
 
 # --- Catálogo global de fragmentos (shard directory) -------------------------
-# Mapeia o prefixo da conta para o nó de base de dados que a guarda.
-# A aplicação usa este catálogo para garantir TRANSPARÊNCIA DE LOCALIZAÇÃO:
-# o cliente só indica "EU-1001", nunca o servidor onde a conta vive.
-_PG_COMMON = (
-    "dbname={db} user={user} password={pwd} sslmode=verify-full "
-    "sslrootcert={ca} connect_timeout=3"
-)
-CA_CERT = os.getenv("CA_CERT", "/certs/ca.crt")
-
-
-def _dsn(host_env: str, port_env: str, default_host: str) -> str:
-    host = os.getenv(host_env, default_host)
-    port = os.getenv(port_env, "5432")
-    base = _PG_COMMON.format(
-        db=os.getenv("DB_NAME", "banco"),
-        user=os.getenv("DB_USER", "app"),
-        pwd=os.getenv("DB_PASSWORD", "app_s3cret"),
-        ca=CA_CERT,
-    )
-    return f"host={host} port={port} {base}"
+# Mapeia o prefixo da conta para o fragmento que a guarda. Cada fragmento tem
+# um PRIMÁRIO e uma RÉPLICA; a cadeia de ligação lista os dois e o libpq escolhe
+# o que aceita escritas (target_session_attrs=read-write). Depois de uma
+# promoção feita pela sentinela, a aplicação passa automaticamente para a réplica.
+def _dsn(prefixo: str, primario: str, replica: str) -> str:
+    hosts = os.getenv(f"DB_{prefixo}_HOSTS", f"{primario},{replica}")
+    portas = os.getenv(f"DB_{prefixo}_PORTS", "5432,5432")
+    return (f"host={hosts} port={portas} dbname={os.getenv('DB_NAME', 'banco')} "
+            f"user={os.getenv('DB_USER', 'app')} password={_segredo('db_app_password', 'DB_PASSWORD')} "
+            f"sslmode=verify-full sslrootcert={CA_CERT} connect_timeout=3 "
+            f"target_session_attrs=read-write")
 
 
 SHARDS = {
-    "EU": _dsn("DB_EUROPA_HOST", "DB_EUROPA_PORT", "db-europa"),
-    "AM": _dsn("DB_AMERICA_HOST", "DB_AMERICA_PORT", "db-america"),
+    "EU": _dsn("EUROPA", "db-europa", "db-europa-r"),
+    "AM": _dsn("AMERICA", "db-america", "db-america-r"),
 }
 SHARD_NOMES = {"EU": "db-europa (Nó A — Europa)", "AM": "db-america (Nó B — América)"}
 
 # --- Segurança -----------------------------------------------------------------
-JWT_PUBLIC_KEY = Path(os.getenv("JWT_PUBLIC_KEY", "/certs/jwt-public.pem")).read_text()
+JWT_PUBLIC_KEY = (PUBLICO / "jwt-public.pem").read_text()
 JWT_ISSUER = os.getenv("JWT_ISSUER", "global-scale-auth")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "global-scale-api")
-SIGNING_PRIVATE_KEY = os.getenv("SIGNING_PRIVATE_KEY", "/certs/core-signing-private.pem")
+SIGNING_PRIVATE_KEY = str(PRIVADO / "core-signing-private.pem")
+DADOS_KEY = PRIVADO / "dados.key"          # chave AES-256 de cifragem em repouso
 TX_MAX_DESVIO_SEGUNDOS = int(os.getenv("TX_MAX_DESVIO_SEGUNDOS", "300"))
 
 # --- Interoperabilidade (banco parceiro / mainframe legado) ------------------

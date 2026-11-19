@@ -31,7 +31,7 @@ import httpx
 
 URL = os.getenv("GSS_URL", "https://localhost:8443").rstrip("/")
 AUTH = os.getenv("GSS_AUTH", URL).rstrip("/")
-CA = os.getenv("GSS_CA", str(Path(__file__).resolve().parent.parent / "certs" / "ca.crt"))
+CA = os.getenv("GSS_CA", str(Path(__file__).resolve().parent.parent / "certs" / "publico" / "ca.crt"))
 TOKEN_FILE = Path(os.getenv("GSS_TOKEN_FILE", Path.home() / ".gss_token"))
 
 AZUL, VERDE, VERM, AMAR, FIM = "\033[94m", "\033[92m", "\033[91m", "\033[93m", "\033[0m"
@@ -202,7 +202,7 @@ def main():
     x = s.add_parser("conta"); x.add_argument("conta_id"); x.set_defaults(f=c_get("/contas/{conta_id}"))
     x = s.add_parser("transferir"); x.add_argument("origem"); x.add_argument("destino"); x.add_argument("valor")
     x.add_argument("--falha", choices=["participante_indisponivel_fase1", "atraso_fase2",
-                                       "crash_coordenador_fase2"])
+                                       "crash_coordenador_fase2", "crash_permanente_coordenador"])
     x.add_argument("--adulterar", action="store_true", help="altera o valor depois do hash")
     x.set_defaults(f=c_transferir)
     x = s.add_parser("estado"); x.add_argument("tx_id"); x.set_defaults(f=c_get("/transferencias/{tx_id}"))

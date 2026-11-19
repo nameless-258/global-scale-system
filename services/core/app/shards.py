@@ -17,6 +17,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from . import config
+from .cripto import cifrar, ctx_contraparte, ctx_titular, decifrar
 
 
 class ContaInexistente(Exception):
@@ -68,21 +69,69 @@ def scatter_gather(sql: str, params: tuple = ()) -> tuple[list[dict], list[str]]
     return resultados, indisponiveis
 
 
+def com_titular(linhas: list[dict]) -> list[dict]:
+    """Decifra o titular (AES-256-GCM) das linhas lidas da BD."""
+    for l in linhas:
+        cif = l.pop("titular_cifrado", None)
+        if l.get("titular") is None and cif is not None:
+            l["titular"] = decifrar(cif, ctx_titular(l["id"]))
+        if isinstance(l.get("moeda"), str):
+            l["moeda"] = l["moeda"].strip()
+    return linhas
+
+
 def obter_conta(conta_id: str) -> dict:
     s = shard_de(conta_id)
     linhas = _consultar_seguro(s, "SELECT * FROM contas WHERE id = %s", (conta_id,))
     if not linhas:
         raise ContaInexistente(f"Conta '{conta_id}' não existe")
     linhas[0]["fragmento"] = config.SHARD_NOMES[s]
-    return linhas[0]
+    return com_titular(linhas)[0]
 
 
 def movimentos_de(conta_id: str) -> list[dict]:
     s = shard_de(conta_id)
-    return _consultar_seguro(
-        s, "SELECT tx_id, tipo, valor, moeda, valor_contraparte, moeda_contraparte, taxa_aplicada, "
-           "contraparte, protocolo, no_coordenador, hash_sha256, criado_em FROM movimentos WHERE conta_id = %s ORDER BY id DESC LIMIT 50",
-        (conta_id,))
+    linhas = _consultar_seguro(
+        s, "SELECT tx_id, conta_id, tipo, valor, moeda, valor_contraparte, moeda_contraparte, "
+           "taxa_aplicada, contraparte_cifrada, protocolo, no_coordenador, hash_sha256, criado_em "
+           "FROM movimentos WHERE conta_id = %s ORDER BY id DESC LIMIT 50", (conta_id,))
+    for l in linhas:
+        l["contraparte"] = decifrar(l.pop("contraparte_cifrada"),
+                                    ctx_contraparte(l["tx_id"], l.pop("conta_id"), l["tipo"]))
+    return linhas
+
+
+def cifrar_titulares() -> list[str]:
+    """Carga inicial: os titulares chegam em claro pelos scripts SQL de arranque;
+    no 1.º arranque a aplicação cifra-os e apaga o texto em claro (idempotente)."""
+    acoes = []
+    for s in config.SHARDS:
+        try:
+            with ligar(s) as c:
+                with c.transaction():
+                    linhas = c.execute("SELECT id, titular FROM contas WHERE titular IS NOT NULL "
+                                       "FOR UPDATE").fetchall()
+                    for l in linhas:
+                        c.execute("UPDATE contas SET titular_cifrado = %s, titular = NULL WHERE id = %s",
+                                  (cifrar(l["titular"], ctx_titular(l["id"])), l["id"]))
+            if linhas:
+                acoes.append(f"{s}: {len(linhas)} titulares cifrados (AES-256-GCM)")
+        except FragmentoIndisponivel:
+            acoes.append(f"{s}: indisponível — cifragem inicial adiada")
+    return acoes
+
+
+def estado_fragmento(shard: str) -> dict:
+    """Que nó é o primário atual do fragmento e em que estado está a réplica."""
+    try:
+        with ligar(shard, autocommit=True) as c:
+            rep = c.execute("SELECT application_name, state, sync_state FROM pg_stat_replication"
+                            ).fetchall()
+            return {"estado": "OK", "primario_atual": c.info.host,
+                    "replicas": [{"nome": r["application_name"], "estado": r["state"],
+                                  "modo": r["sync_state"]} for r in rep] or "nenhuma ligada"}
+    except FragmentoIndisponivel:
+        return {"estado": "INDISPONÍVEL"}
 
 
 def _consultar_seguro(shard, sql, params):

@@ -1,36 +1,38 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Global-Scale System — geração da PKI (Infraestrutura de Chave Pública)
+# Global-Scale System — PKI e SEGREDOS, distribuídos por serviço
 #
-# Gera:
-#   - uma Autoridade de Certificação (CA) própria;
-#   - um certificado TLS por serviço (gateway, auth, api-1, api-2, legacy,
-#     db-europa, db-america), com Subject Alternative Names (SAN);
-#   - o par de chaves RSA usado para assinar os JWT (RS256);
-#   - o par de chaves RSA usado pelo núcleo para assinar digitalmente as
-#     mensagens XML enviadas ao sistema legado (SHA256withRSA);
-#   - um keystore PKCS#12 para o servidor HTTPS em Java.
+# Princípio do menor privilégio: cada contentor monta APENAS
+#   certs/publico/      -> material público (CA, chaves públicas)      [todos]
+#   certs/<serviço>/    -> as SUAS chaves privadas e palavras-passe    [só ele]
+# Assim, por exemplo, uma réplica da API comprometida não consegue ler a chave
+# privada de assinatura dos JWT (que só existe em certs/auth/).
+#
+#   certs/ca/           -> chave privada da CA (NUNCA montada em contentores)
 #
 # Uso:  bash scripts/gen-certs.sh [pasta_destino]     (por omissão ./certs)
-# Idempotente: se a CA já existir, não faz nada (use FORCE=1 para regenerar).
+# Idempotente: se a PKI já existir, não faz nada (FORCE=1 para regenerar).
 # =============================================================================
 set -euo pipefail
 
 OUT="${1:-./certs}"
 DAYS=825
-P12_PASS="${P12_PASS:-globalscale}"
-
 mkdir -p "$OUT"
 cd "$OUT"
 
-if [[ -f ca.crt && "${FORCE:-0}" != "1" ]]; then
+if [[ -f publico/ca.crt && "${FORCE:-0}" != "1" ]]; then
   echo "[certs] PKI já existe em $(pwd) — nada a fazer (FORCE=1 para regenerar)."
   exit 0
 fi
 
+SERVICOS="gateway auth api-1 api-2 legacy db-europa db-europa-r db-america db-america-r sentinela"
+mkdir -p ca publico tmp
+for s in $SERVICOS; do mkdir -p "$s"; done
+
+# ------------------------------------------------------------------ CA
 echo "[certs] A gerar Autoridade de Certificação (CA)..."
-openssl genrsa -out ca.key 4096 2>/dev/null
-cat > ca.cnf <<'CNF'
+openssl genrsa -out ca/ca.key 4096 2>/dev/null
+cat > tmp/ca.cnf <<'CNF'
 [req]
 distinguished_name=dn
 [dn]
@@ -39,53 +41,69 @@ basicConstraints=critical,CA:TRUE
 keyUsage=critical,keyCertSign,cRLSign
 subjectKeyIdentifier=hash
 CNF
-openssl req -x509 -new -key ca.key -sha256 -days "$DAYS" -out ca.crt \
+openssl req -x509 -new -key ca/ca.key -sha256 -days "$DAYS" -out publico/ca.crt \
   -subj "/C=MZ/O=Global Scale Corporation/CN=Global Scale Root CA" \
-  -config ca.cnf -extensions v3_ca
-rm -f ca.cnf
+  -config tmp/ca.cnf -extensions v3_ca
 
-emitir() {  # emitir <nome> <SANs separados por vírgula>
+emitir() {  # emitir <serviço> <SANs>  -> <serviço>/tls.crt + tls.key
   local nome="$1" sans="$2"
-  openssl genrsa -out "$nome.key" 2048 2>/dev/null
-  openssl req -new -key "$nome.key" -out "$nome.csr" \
+  openssl genrsa -out "$nome/tls.key" 2048 2>/dev/null
+  openssl req -new -key "$nome/tls.key" -out "tmp/$nome.csr" \
     -subj "/C=MZ/O=Global Scale Corporation/CN=$nome"
-  cat > "$nome.ext" <<EOF
+  cat > "tmp/$nome.ext" <<EOF
 basicConstraints=critical,CA:FALSE
 keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth,clientAuth
 subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid,issuer
-extendedKeyUsage=serverAuth,clientAuth
 subjectAltName=$sans
 EOF
-  openssl x509 -req -in "$nome.csr" -CA ca.crt -CAkey ca.key -CAcreateserial \
-    -out "$nome.crt" -days "$DAYS" -sha256 -extfile "$nome.ext" 2>/dev/null
-  rm -f "$nome.csr" "$nome.ext"
+  openssl x509 -req -in "tmp/$nome.csr" -CA publico/ca.crt -CAkey ca/ca.key \
+    -CAcreateserial -CAserial tmp/ca.srl -out "$nome/tls.crt" -days "$DAYS" -sha256 \
+    -extfile "tmp/$nome.ext" 2>/dev/null
   echo "[certs]   ✓ $nome  ($sans)"
 }
 
-echo "[certs] A emitir certificados de servidor..."
-emitir gateway    "DNS:gateway,DNS:localhost,IP:127.0.0.1,IP:172.28.0.10"
-emitir auth       "DNS:auth,DNS:localhost,IP:127.0.0.1,IP:172.28.0.11"
-emitir api-1      "DNS:api-1,DNS:api,DNS:localhost,IP:127.0.0.1,IP:172.28.0.21"
-emitir api-2      "DNS:api-2,DNS:api,DNS:localhost,IP:127.0.0.1,IP:172.28.0.22"
-emitir legacy     "DNS:legacy,DNS:localhost,IP:127.0.0.1,IP:172.28.0.31"
-emitir db-europa  "DNS:db-europa,DNS:localhost,IP:127.0.0.1,IP:172.28.0.41"
-emitir db-america "DNS:db-america,DNS:localhost,IP:127.0.0.1,IP:172.28.0.42"
+echo "[certs] A emitir certificados TLS de servidor..."
+emitir gateway      "DNS:gateway,DNS:localhost,IP:127.0.0.1,IP:172.28.0.10"
+emitir auth         "DNS:auth,DNS:localhost,IP:127.0.0.1,IP:172.28.0.11"
+emitir api-1        "DNS:api-1,DNS:api,DNS:localhost,IP:127.0.0.1,IP:172.28.0.21"
+emitir api-2        "DNS:api-2,DNS:api,DNS:localhost,IP:127.0.0.1,IP:172.28.0.22"
+emitir legacy       "DNS:legacy,DNS:localhost,IP:127.0.0.1,IP:172.28.0.31"
+emitir db-europa    "DNS:db-europa,DNS:localhost,IP:127.0.0.1,IP:172.28.0.41"
+emitir db-america   "DNS:db-america,DNS:localhost,IP:127.0.0.1,IP:172.28.0.42"
+emitir db-europa-r  "DNS:db-europa-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.43"
+emitir db-america-r "DNS:db-america-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.44"
 
-echo "[certs] A gerar chaves JWT (RS256)..."
-openssl genrsa -out jwt-private.pem 2048 2>/dev/null
-openssl rsa -in jwt-private.pem -pubout -out jwt-public.pem 2>/dev/null
+echo "[certs] A gerar pares de chaves de assinatura..."
+openssl genrsa -out auth/jwt-private.pem 2048 2>/dev/null                  # só o emissor
+openssl rsa -in auth/jwt-private.pem -pubout -out publico/jwt-public.pem 2>/dev/null
+openssl genrsa -out tmp/core-signing-private.pem 2048 2>/dev/null           # só o núcleo
+openssl rsa -in tmp/core-signing-private.pem -pubout -out publico/core-signing-public.pem 2>/dev/null
+cp tmp/core-signing-private.pem api-1/; cp tmp/core-signing-private.pem api-2/
 
-echo "[certs] A gerar chaves de assinatura de mensagens (núcleo -> legado)..."
-openssl genrsa -out core-signing-private.pem 2048 2>/dev/null
-openssl rsa -in core-signing-private.pem -pubout -out core-signing-public.pem 2>/dev/null
+echo "[certs] A gerar segredos aleatórios..."
+segredo() { openssl rand -hex 18; }
+PG_ADMIN=$(segredo); PG_APP=$(segredo); PG_REPL=$(segredo); P12=$(segredo)
+DADOS=$(openssl rand -base64 32)          # chave AES-256 de cifragem em repouso
+for s in db-europa db-europa-r db-america db-america-r; do
+  printf '%s' "$PG_ADMIN" > "$s/postgres_password"
+  printf '%s' "$PG_APP"   > "$s/db_app_password"
+  printf '%s' "$PG_REPL"  > "$s/replicador_password"
+done
+for s in api-1 api-2; do
+  printf '%s' "$PG_APP" > "$s/db_app_password"
+  printf '%s' "$DADOS"  > "$s/dados.key"
+done
+printf '%s' "$PG_ADMIN" > sentinela/postgres_password
+printf '%s' "$P12"      > legacy/keystore_pass
 
 echo "[certs] A gerar keystore PKCS#12 para o servidor Java..."
-openssl pkcs12 -export -in legacy.crt -inkey legacy.key -certfile ca.crt \
-  -name legacy -out legacy.p12 -passout "pass:$P12_PASS"
+openssl pkcs12 -export -in legacy/tls.crt -inkey legacy/tls.key -certfile publico/ca.crt \
+  -name legacy -out legacy/legacy.p12 -passout "pass:$P12"
 
-# Os contentores correm com utilizadores diferentes; as chaves privadas são
-# copiadas e protegidas (chmod 600) pelo entrypoint de cada serviço.
-chmod 644 ./*.crt ./*.pem ./*.p12
-chmod 644 ./*.key
-echo "[certs] PKI pronta em $(pwd)"
+rm -rf tmp
+# Os contentores correm com utilizadores diferentes; cada entrypoint copia e
+# protege (chmod 600) o que precisa. Em Windows estas permissões são ignoradas.
+chmod -R a+rX publico */ 2>/dev/null || true
+echo "[certs] PKI e segredos prontos em $(pwd)"

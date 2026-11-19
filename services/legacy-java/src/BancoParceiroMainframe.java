@@ -64,12 +64,16 @@ public class BancoParceiroMainframe {
     private static final Map<String, Map<String, String>> ORDENS = new ConcurrentHashMap<>();
     private static final AtomicLong SEQ = new AtomicLong(700000);
     private static PublicKey chaveNucleo;
+    private static Path registo;                         // registo persistente das ordens (append-only)
 
     public static void main(String[] args) throws Exception {
         int porta = Integer.parseInt(env("PORTA", "8443"));
-        String keystore = env("KEYSTORE", "/certs/legacy.p12");
-        char[] pass = env("KEYSTORE_PASS", "globalscale").toCharArray();
-        chaveNucleo = carregarChavePublica(env("CHAVE_PUBLICA_NUCLEO", "/certs/core-signing-public.pem"));
+        String keystore = env("KEYSTORE", "/certs/privado/legacy.p12");
+        char[] pass = Files.readString(Path.of(env("KEYSTORE_PASS_FILE", "/certs/privado/keystore_pass")))
+                .trim().toCharArray();                       // segredo lido de ficheiro, não do código
+        chaveNucleo = carregarChavePublica(env("CHAVE_PUBLICA_NUCLEO", "/certs/publico/core-signing-public.pem"));
+        registo = Path.of(env("REGISTO_ORDENS", "/data/ordens.log"));
+        carregarOrdens();
 
         KeyStore ks = KeyStore.getInstance("PKCS12");
         try (FileInputStream in = new FileInputStream(keystore)) { ks.load(in, pass); }
@@ -178,6 +182,7 @@ public class BancoParceiroMainframe {
         r.put("Moeda", moeda);
         r.put("ProcessadoEm", Instant.now().toString());
         r.put("Sistema", "MAINFRAME-JAVA");
+        persistir(r);                                    // primeiro em disco, depois em memória
         ORDENS.put(ref, r);
         log("Registo de largura fixa (estilo COBOL): " + registoLarguraFixa(ref, iban, valor, moeda, r.get("Estado")));
         responder(ex, 200, xml("RespostaOrdem", r));
@@ -258,6 +263,40 @@ public class BancoParceiroMainframe {
                                              String estado) {
         return String.format("%-36s|%-34s|%015d|%-3s|%-9s", ref, iban,
                 v.movePointRight(2).longValue(), moeda, estado);
+    }
+
+    // ------------------------------------------------------- Persistência
+    // Cada ordem é acrescentada ao ficheiro (uma linha "chave=valor<TAB>...") e
+    // forçada para o disco (fsync) antes de se responder. No arranque, o ficheiro
+    // é relido: o banco parceiro não "esquece" ordens já aceites após um reinício,
+    // o que é essencial para a idempotência e para a recuperação das Sagas.
+    private static synchronized void persistir(Map<String, String> r) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        r.forEach((k, v) -> sb.append(k).append('=').append(v.replace('\t', ' ').replace('\n', ' ')).append('\t'));
+        sb.append('\n');
+        Files.createDirectories(registo.getParent());
+        try (java.nio.channels.FileChannel ch = java.nio.channels.FileChannel.open(registo,
+                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND,
+                java.nio.file.StandardOpenOption.WRITE)) {
+            ch.write(java.nio.ByteBuffer.wrap(sb.toString().getBytes(StandardCharsets.UTF_8)));
+            ch.force(true);
+        }
+    }
+
+    private static void carregarOrdens() throws IOException {
+        if (!Files.exists(registo)) return;
+        for (String linha : Files.readAllLines(registo, StandardCharsets.UTF_8)) {
+            Map<String, String> r = new LinkedHashMap<>();
+            for (String par : linha.split("\t")) {
+                int i = par.indexOf('=');
+                if (i > 0) r.put(par.substring(0, i), par.substring(i + 1));
+            }
+            if (r.containsKey("Referencia")) ORDENS.put(r.get("Referencia"), r);
+        }
+        ORDENS.values().stream().map(o -> o.getOrDefault("CodigoAutorizacao", "MF0"))
+                .filter(c -> c.startsWith("MF")).mapToLong(c -> Long.parseLong(c.substring(2)))
+                .max().ifPresent(m -> SEQ.set(Math.max(SEQ.get(), m)));
+        log("Registo persistente carregado: " + ORDENS.size() + " ordens");
     }
 
     private static String env(String k, String def) {
