@@ -32,6 +32,7 @@ Garantia das propriedades ACID na transação distribuída
 """
 import json
 import os
+import socket
 import threading
 import time
 import uuid
@@ -42,6 +43,7 @@ from pathlib import Path
 import psycopg
 
 from . import config, legado
+from .cripto import cifrar, ctx_contraparte
 from .shards import ContaInexistente, FragmentoIndisponivel, ligar, shard_de
 
 
@@ -74,6 +76,8 @@ FALHAS_2PC = {
         "O coordenador espera 20s após decidir COMMIT (janela para fazer 'docker stop' de um nó)",
     "crash_coordenador_fase2":
         "O coordenador (este processo) morre após decidir COMMIT e confirmar só 1 participante",
+    "crash_permanente_coordenador":
+        "Como o anterior, mas o coordenador NÃO volta: a outra réplica da API assume a recuperação",
 }
 FALHAS_SAGA = {
     None: "sem falha",
@@ -172,10 +176,11 @@ def movimentar(c, conta: str, tipo: str, valor: Decimal, moeda: str, tx_id, cont
     try:
         c.execute(
             "INSERT INTO movimentos (tx_id, conta_id, tipo, valor, moeda, valor_contraparte, "
-            "moeda_contraparte, taxa_aplicada, contraparte, hash_sha256, protocolo, no_coordenador) "
-            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (tx_id, conta, tipo, valor, moeda, vc, mc, taxa, contraparte, hash_tx, protocolo,
-             config.NODE_ID))
+            "moeda_contraparte, taxa_aplicada, contraparte_cifrada, hash_sha256, protocolo, "
+            "no_coordenador) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            (tx_id, conta, tipo, valor, moeda, vc, mc, taxa,
+             cifrar(contraparte, ctx_contraparte(tx_id, conta, tipo)),   # IBAN/conta cifrados
+             hash_tx, protocolo, config.NODE_ID))
     except psycopg.errors.UniqueViolation:
         raise TransacaoDuplicada(f"A transação {tx_id} já foi processada (proteção anti-replay / "
                                  f"idempotência)")
@@ -337,9 +342,12 @@ class Coordenador:
                     pendentes.append(shard)
                     r(f"FASE 2: {shard} inacessível ({type(e).__name__}); fica PREPARADA e será "
                       f"confirmada pela recuperação automática")
-                if falha == "crash_coordenador_fase2" and i == 0:
+                if falha in ("crash_coordenador_fase2", "crash_permanente_coordenador") and i == 0:
                     r("⚡ FALHA INJETADA: o processo coordenador vai terminar abruptamente")
-                    self.auditoria.registar("2PC_CRASH_SIMULADO", tx_id=tx_id)
+                    self.auditoria.registar("2PC_CRASH_SIMULADO", tx_id=tx_id, falha=falha)
+                    if falha == "crash_permanente_coordenador":
+                        # marca que impede este nó de voltar (simula uma máquina perdida)
+                        (config.DATA_DIR / f"{config.NODE_ID}.desativado").write_text("1")
                     os._exit(1)                         # morte súbita (sem limpeza)
 
             if pendentes:
@@ -539,6 +547,9 @@ class Coordenador:
         with self.lock:
             em_curso = set(self.em_curso)
         alcancaveis, ainda_preparadas = set(), set()
+        mortos = self._peers_em_baixo()
+        estados_peers = {p: RegistoDuravel(config.DATA_DIR / f"coordenador-2pc-{p}.log").estados()
+                         for p in mortos}
 
         for shard in config.SHARDS:
             try:
@@ -550,7 +561,11 @@ class Coordenador:
             with c:
                 for xid in c.tpc_recover():
                     gtrid = xid.gtrid or ""
-                    if not gtrid.startswith(config.NODE_ID + "|") or gtrid in em_curso:
+                    dono = gtrid.split("|", 1)[0]
+                    if dono in mortos:
+                        acoes += self._assumir_de_peer(c, xid, shard, dono, estados_peers[dono])
+                        continue
+                    if dono != config.NODE_ID or gtrid in em_curso:
                         continue
                     decisao = estados.get(gtrid, {}).get("decisao")
                     if decisao == "COMMIT":
@@ -581,6 +596,45 @@ class Coordenador:
         acoes += self._recuperar_sagas()
         return acoes
 
+    def _peers_em_baixo(self) -> list[str]:
+        """Outras réplicas da API cuja porta não responde (consideradas em baixo)."""
+        mortos = []
+        for p in config.PEERS:
+            if p == config.NODE_ID:
+                continue
+            host, _, porta = config.PEER_ENDERECOS.get(p, f"{p}:{config.PEER_PORTA}").partition(":")
+            try:
+                socket.create_connection((host, int(porta)), timeout=2).close()
+            except OSError:
+                mortos.append(p)
+        return mortos
+
+    def _assumir_de_peer(self, c, xid, shard, dono, estados_dono) -> list[str]:
+        """Recuperação por OUTRO coordenador: o registo (WAL) de cada coordenador
+        está num volume partilhado, por isso esta réplica consegue ler a decisão
+        que o coordenador em baixo tomou e concluí-la por ele.
+          * decisão COMMIT  -> COMMIT PREPARED (seguro em qualquer momento)
+          * decisão ABORT   -> ROLLBACK PREPARED
+          * sem decisão     -> presumed abort, só depois de PRESUMED_ABORT_APOS_S"""
+        gtrid = xid.gtrid
+        decisao = estados_dono.get(gtrid, {}).get("decisao")
+        idade = (datetime.now(timezone.utc) - xid.prepared).total_seconds() if xid.prepared else 1e9
+        try:
+            if decisao == "COMMIT":
+                c.tpc_commit(xid)
+                acao = "COMMIT PREPARED"
+            elif decisao == "ABORT" or idade > config.PRESUMED_ABORT_APOS_S:
+                c.tpc_rollback(xid)
+                acao = "ROLLBACK PREPARED" + ("" if decisao == "ABORT" else " (presumed abort)")
+            else:
+                return []
+        except psycopg.Error as e:                       # o dono pode tê-la concluído entretanto
+            return [f"{shard}: {gtrid} já não está preparada ({type(e).__name__})"]
+        self.auditoria.registar("2PC_RECUPERACAO_POR_PEER", gtrid=gtrid, shard=shard,
+                                coordenador_original=dono, acao=acao)
+        return [f"{shard}: {config.NODE_ID} assumiu {gtrid} do coordenador {dono} (em baixo): "
+                f"{acao} (decisão no WAL de {dono} = {decisao or 'nenhuma'})"]
+
     def _recuperar_sagas(self) -> list[str]:
         """Sagas interrompidas a meio (ex: crash depois de T1): pergunta ao legado
         pelo estado real da ordem (consulta idempotente) antes de compensar."""
@@ -609,7 +663,14 @@ class Coordenador:
         return acoes
 
     def ciclo_recuperacao(self, parar: threading.Event):
+        from .shards import cifrar_titulares
         while not parar.wait(config.RECUPERACAO_INTERVALO_S):
+            try:
+                for a in cifrar_titulares():
+                    if "cifrados" in a:
+                        print(f"[cifragem] {a}", flush=True)
+            except Exception:
+                pass
             try:
                 for a in self.recuperar():
                     print(f"[recuperação] {a}", flush=True)

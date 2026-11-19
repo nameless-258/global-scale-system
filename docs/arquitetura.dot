@@ -14,9 +14,15 @@ digraph G {
     wal   [label="WAL do coordenador\n(volume coordenador-data)", shape=cylinder, fillcolor="#f4f4f4"];
   }
 
-  subgraph cluster_db { label="BD Distribuída (PostgreSQL 16)\nfragmentação horizontal\nacesso via 2PC · TLS verify-full"; style="rounded,dashed"; color="#888888";
-    dbeu [label="db-europa — Nó A\n172.28.0.41 :5432\ncontas EU-*", shape=cylinder, fillcolor="#e5d8f5"];
-    dbam [label="db-america — Nó B\n172.28.0.42 :5432\ncontas AM-*", shape=cylinder, fillcolor="#e5d8f5"];
+  subgraph cluster_db { label="BD Distribuída (PostgreSQL 16)\nfragmentos + réplicas síncronas · dados pessoais cifrados (AES-256-GCM)"; style="rounded,dashed"; color="#888888";
+    dbeu [label="db-europa — Nó A (primário)\n172.28.0.41 :5432\ncontas EU-*", shape=cylinder, fillcolor="#e5d8f5"];
+    dbeur [label="db-europa-r (réplica)\n172.28.0.43", shape=cylinder, fillcolor="#f1ebfa"];
+    dbam [label="db-america — Nó B (primário)\n172.28.0.42 :5432\ncontas AM-*", shape=cylinder, fillcolor="#e5d8f5"];
+    dbamr [label="db-america-r (réplica)\n172.28.0.44", shape=cylinder, fillcolor="#f1ebfa"];
+    sent [label="sentinela\n172.28.0.45\nfailover + fencing", fillcolor="#ffe0cc"];
+    dbeu -> dbeur [label="streaming\nsíncrono", style=dashed, color="#7b4fb0"];
+    dbam -> dbamr [label="streaming\nsíncrono", style=dashed, color="#7b4fb0"];
+    sent -> dbeu [style=dotted, arrowhead=none]; sent -> dbam [style=dotted, arrowhead=none];
   }
 
   subgraph cluster_dfs { label="DFS — HDFS (replicação = 2)"; style="rounded,dashed"; color="#888888";
@@ -37,6 +43,7 @@ digraph G {
   wal -> api1 [style=invis];
   api1 -> wal [style=dashed, arrowhead=none, label="fsync"]; api2 -> wal [style=dashed, arrowhead=none, constraint=false];
   {rank=same; dbeu; dbam; nn; legacy;}
+  {rank=same; dbeur; dbamr; sent;}
   {rank=same; dn1; dn2;}
   api1 -> dbeu; api1 -> dbam;
   api2 -> dbeu; api2 -> dbam;

@@ -15,12 +15,24 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
-from . import config, legado
+from . import config
+
+# Simulação de falha PERMANENTE de um coordenador: enquanto existir a marca, este
+# nó não arranca (como uma máquina perdida). A outra réplica assume a recuperação.
+_marca = config.DATA_DIR / f"{config.NODE_ID}.desativado"
+if _marca.exists():
+    import time as _t
+    print(f"[{config.NODE_ID}] DESATIVADO (simulação de falha permanente). Para reativar: "
+          f"apague {_marca} e reinicie o contentor.", flush=True)
+    while _marca.exists():
+        _t.sleep(5)
+
+from . import legado  # noqa: E402
 from .dfs import AuditoriaEncadeada, DFSErro, criar_dfs, verificar_cadeia
 from .security import (Utilizador, exigir_admin, sha256_hex, utilizador_atual,
                        verificar_frescura, verificar_integridade)
-from .shards import (ContaInexistente, FragmentoIndisponivel, movimentos_de, obter_conta,
-                     para_json, scatter_gather)
+from .shards import (ContaInexistente, FragmentoIndisponivel, cifrar_titulares, com_titular,
+                     estado_fragmento, movimentos_de, obter_conta, para_json, scatter_gather)
 from .transacoes import (FALHAS_2PC, FALHAS_SAGA, Coordenador, NaoAutorizado,
                          SaldoInsuficiente, TaxasInconsistentes, TransacaoDuplicada)
 
@@ -33,6 +45,8 @@ _parar = threading.Event()
 @asynccontextmanager
 async def ciclo_de_vida(app: FastAPI):
     auditoria.registar("NO_ARRANCOU", no=config.NODE_ID)
+    for a in cifrar_titulares():
+        print(f"[cifragem] {a}", flush=True)
     # Recuperação imediata no arranque (essencial após um crash do coordenador)
     try:
         for a in coordenador.recuperar():
@@ -134,9 +148,8 @@ def raiz():
 def saude():
     estado = {"no": config.NODE_ID, "hora": datetime.now(timezone.utc).isoformat(),
               "fragmentos": {}, "dfs": None, "legado": None}
-    _, indisponiveis = scatter_gather("SELECT 1 AS ok")
     for s, nome in config.SHARD_NOMES.items():
-        estado["fragmentos"][nome] = "INDISPONÍVEL" if nome in indisponiveis else "OK"
+        estado["fragmentos"][nome] = estado_fragmento(s)
     try:
         estado["dfs"] = dfs.saude()
     except Exception as e:
@@ -154,12 +167,13 @@ def saude():
 def listar_contas(u: Utilizador = Depends(utilizador_atual)):
     """Consulta GLOBAL (scatter-gather paralelo sobre todos os fragmentos)."""
     if u.is_admin:
-        linhas, falhas = scatter_gather("SELECT id, titular, regiao, moeda, saldo, versao "
-                                        "FROM contas ORDER BY id")
+        linhas, falhas = scatter_gather("SELECT id, titular, titular_cifrado, regiao, moeda, saldo, "
+                                        "versao FROM contas ORDER BY id")
     else:
-        linhas, falhas = scatter_gather("SELECT id, titular, regiao, moeda, saldo, versao "
-                                        "FROM contas WHERE owner_username = %s ORDER BY id",
+        linhas, falhas = scatter_gather("SELECT id, titular, titular_cifrado, regiao, moeda, saldo, "
+                                        "versao FROM contas WHERE owner_username = %s ORDER BY id",
                                         (u.username,))
+    com_titular(linhas)
     return {"utilizador": u.username, "contas": [{k: para_json(v) for k, v in l.items()}
                                                   for l in linhas],
             "fragmentos_indisponiveis": falhas,
@@ -180,7 +194,7 @@ def detalhe_conta(conta_id: str, u: Utilizador = Depends(utilizador_atual)):
 @app.post("/transferencias", tags=["transações"])
 def transferir(pedido: PedidoTransferencia,
                falha: Literal["participante_indisponivel_fase1", "atraso_fase2",
-                              "crash_coordenador_fase2"] | None = Query(
+                              "crash_coordenador_fase2", "crash_permanente_coordenador"] | None = Query(
                    default=None, description="Injeção de falha (apenas para demonstração)"),
                u: Utilizador = Depends(utilizador_atual)):
     hash_ok = verificar_integridade(pedido.campos(), pedido.hash_sha256)
@@ -258,7 +272,9 @@ def totais(u: Utilizador = Depends(utilizador_atual)):
 @app.post("/relatorios", tags=["dfs"])
 def gerar_relatorio(u: Utilizador = Depends(utilizador_atual)):
     exigir_admin(u)
-    linhas, falhas = scatter_gather("SELECT id, titular, regiao, moeda, saldo FROM contas ORDER BY id")
+    linhas, falhas = scatter_gather("SELECT id, titular, titular_cifrado, regiao, moeda, saldo "
+                                    "FROM contas ORDER BY id")
+    com_titular(linhas)
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["conta", "titular", "regiao", "moeda", "saldo", "fragmento"])

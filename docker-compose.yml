@@ -2,6 +2,9 @@
 #  GLOBAL-SCALE SYSTEM — Plataforma financeira distribuída e resiliente
 #  Arranque:   docker compose up -d --build
 #  Gateway:    https://localhost:8443/docs     HDFS UI: http://localhost:9870
+#
+#  Segredos: cada serviço monta apenas certs/publico (CA e chaves públicas) e a
+#  SUA pasta certs/<serviço> (chaves privadas e palavras-passe). Ver gen-certs.sh.
 # =============================================================================
 name: global-scale-system
 
@@ -13,14 +16,9 @@ x-api: &api
     db-europa:  { condition: service_healthy }
     db-america: { condition: service_healthy }
     namenode:   { condition: service_started }
-  volumes:
-    - ./certs:/certs:ro
-    - coordenador-data:/data         # registo durável (WAL) do coordenador 2PC
 
 x-api-env: &api-env
-  DB_EUROPA_HOST: db-europa
-  DB_AMERICA_HOST: db-america
-  DB_PASSWORD: app_s3cret
+  PEERS: api-1,api-2
   LEGACY_URL: https://legacy:8443
   DFS_BACKEND: webhdfs
   DFS_URL: http://namenode:9870
@@ -30,13 +28,11 @@ x-postgres: &postgres
   image: postgres:16-alpine
   restart: unless-stopped
   entrypoint: ["bash", "/db/entrypoint.sh"]
-  depends_on:
-    certs: { condition: service_completed_successfully }
   healthcheck:
     test: ["CMD-SHELL", "pg_isready -U postgres -d banco"]
     interval: 3s
     timeout: 3s
-    retries: 20
+    retries: 40
 
 x-hadoop: &hadoop
   image: apache/hadoop:3.3.6
@@ -44,7 +40,7 @@ x-hadoop: &hadoop
   restart: unless-stopped
 
 services:
-  # ---------------------------------------------------------------- PKI
+  # ---------------------------------------------------------- PKI e segredos
   certs:
     image: alpine:3.20
     command: sh -c "apk add --no-cache openssl bash >/dev/null && bash /scripts/gen-certs.sh /certs"
@@ -54,39 +50,109 @@ services:
     networks: [global-net]
 
   # ------------------------------------------------- Base de Dados Distribuída
-  db-europa:                          # Nó A — fragmento Europa (contas EU-*)
+  # Fragmento A — Europa (contas EU-*): primário + réplica síncrona
+  db-europa:
     <<: *postgres
     hostname: db-europa
+    depends_on:
+      certs: { condition: service_completed_successfully }
     environment:
-      POSTGRES_PASSWORD: postgres_admin
+      POSTGRES_PASSWORD_FILE: /certs/privado/postgres_password
       POSTGRES_DB: banco
       DB_NODE_NAME: db-europa
+      DB_ROLE: primario
     volumes:
-      - ./certs:/certs:ro
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/db-europa:/certs/privado:ro
       - ./db/entrypoint.sh:/db/entrypoint.sh:ro
       - ./db/00-pg-hba.sh:/docker-entrypoint-initdb.d/00-pg-hba.sh:ro
       - ./db/schema.inc:/docker-entrypoint-initdb.d/schema.inc:ro
       - ./db/init-europa.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./db/20-segredos.sh:/docker-entrypoint-initdb.d/20-segredos.sh:ro
       - pg-europa:/var/lib/postgresql/data
+      - fencing:/fence
     networks:
       global-net: { ipv4_address: 172.28.0.41 }
 
-  db-america:                         # Nó B — fragmento América (contas AM-*)
+  db-europa-r:
+    <<: *postgres
+    hostname: db-europa-r
+    depends_on:
+      db-europa: { condition: service_healthy }
+    environment:
+      POSTGRES_PASSWORD_FILE: /certs/privado/postgres_password
+      DB_NODE_NAME: db-europa-r
+      DB_ROLE: replica
+      DB_PRIMARIO: db-europa
+      DB_APP_NAME: db_europa_r
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/db-europa-r:/certs/privado:ro
+      - ./db/entrypoint.sh:/db/entrypoint.sh:ro
+      - pg-europa-r:/var/lib/postgresql/data
+      - fencing:/fence
+    networks:
+      global-net: { ipv4_address: 172.28.0.43 }
+
+  # Fragmento B — América (contas AM-*): primário + réplica síncrona
+  db-america:
     <<: *postgres
     hostname: db-america
+    depends_on:
+      certs: { condition: service_completed_successfully }
     environment:
-      POSTGRES_PASSWORD: postgres_admin
+      POSTGRES_PASSWORD_FILE: /certs/privado/postgres_password
       POSTGRES_DB: banco
       DB_NODE_NAME: db-america
+      DB_ROLE: primario
     volumes:
-      - ./certs:/certs:ro
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/db-america:/certs/privado:ro
       - ./db/entrypoint.sh:/db/entrypoint.sh:ro
       - ./db/00-pg-hba.sh:/docker-entrypoint-initdb.d/00-pg-hba.sh:ro
       - ./db/schema.inc:/docker-entrypoint-initdb.d/schema.inc:ro
       - ./db/init-america.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./db/20-segredos.sh:/docker-entrypoint-initdb.d/20-segredos.sh:ro
       - pg-america:/var/lib/postgresql/data
+      - fencing:/fence
     networks:
       global-net: { ipv4_address: 172.28.0.42 }
+
+  db-america-r:
+    <<: *postgres
+    hostname: db-america-r
+    depends_on:
+      db-america: { condition: service_healthy }
+    environment:
+      POSTGRES_PASSWORD_FILE: /certs/privado/postgres_password
+      DB_NODE_NAME: db-america-r
+      DB_ROLE: replica
+      DB_PRIMARIO: db-america
+      DB_APP_NAME: db_america_r
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/db-america-r:/certs/privado:ro
+      - ./db/entrypoint.sh:/db/entrypoint.sh:ro
+      - pg-america-r:/var/lib/postgresql/data
+      - fencing:/fence
+    networks:
+      global-net: { ipv4_address: 172.28.0.44 }
+
+  # Sentinela: gere a replicação síncrona e faz o failover automático
+  sentinela:
+    build: ./services/core
+    hostname: sentinela
+    restart: unless-stopped
+    command: ["python", "-u", "-m", "app.sentinela"]
+    depends_on:
+      db-europa:  { condition: service_healthy }
+      db-america: { condition: service_healthy }
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/sentinela:/certs/privado:ro
+      - fencing:/fence
+    networks:
+      global-net: { ipv4_address: 172.28.0.45 }
 
   # ------------------------------------------ Sistema de Ficheiros Distribuído
   namenode:                           # metadados do HDFS
@@ -123,7 +189,9 @@ services:
     restart: unless-stopped
     depends_on:
       certs: { condition: service_completed_successfully }
-    volumes: [./certs:/certs:ro]
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/auth:/certs/privado:ro          # só este nó tem a chave privada JWT
     networks:
       global-net: { ipv4_address: 172.28.0.11 }
 
@@ -133,6 +201,10 @@ services:
     environment:
       <<: *api-env
       NODE_ID: api-1
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/api-1:/certs/privado:ro
+      - coordenador-data:/data        # registo durável (WAL) dos coordenadores (partilhado)
     networks:
       global-net: { ipv4_address: 172.28.0.21 }
 
@@ -142,6 +214,10 @@ services:
     environment:
       <<: *api-env
       NODE_ID: api-2
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/api-2:/certs/privado:ro
+      - coordenador-data:/data
     networks:
       global-net: { ipv4_address: 172.28.0.22 }
 
@@ -151,11 +227,10 @@ services:
     restart: unless-stopped
     depends_on:
       certs: { condition: service_completed_successfully }
-    environment:
-      KEYSTORE: /certs/legacy.p12
-      KEYSTORE_PASS: globalscale
-      CHAVE_PUBLICA_NUCLEO: /certs/core-signing-public.pem
-    volumes: [./certs:/certs:ro]
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/legacy:/certs/privado:ro
+      - legacy-data:/data             # registo persistente das ordens
     networks:
       global-net: { ipv4_address: 172.28.0.31 }
 
@@ -169,7 +244,8 @@ services:
       - "8080:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./certs:/certs:ro
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/gateway:/certs/privado:ro
     networks:
       global-net: { ipv4_address: 172.28.0.10 }
 
@@ -180,11 +256,11 @@ services:
     entrypoint: ["python", "/scripts/cliente.py"]
     environment:
       GSS_URL: https://gateway
-      GSS_CA: /certs/ca.crt
+      GSS_CA: /certs/publico/ca.crt
       GSS_TOKEN_FILE: /token/jwt
     volumes:
       - ./scripts:/scripts:ro
-      - ./certs:/certs:ro
+      - ./certs/publico:/certs/publico:ro
       - cliente-token:/token
     networks: [global-net]
 
@@ -198,6 +274,10 @@ networks:
 
 volumes:
   pg-europa:
+  pg-europa-r:
   pg-america:
+  pg-america-r:
   coordenador-data:
+  legacy-data:
+  fencing:
   cliente-token:
