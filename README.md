@@ -5,7 +5,7 @@
 Projeto prático do Exame Laboratorial da disciplina **Sistemas Distribuídos e Paralelos**
 (Licenciatura em Engenharia e Ciência dos Computadores — ISUTC).
 
-![Arquitetura](docs/arquitetura.png)
+
 
 ## Componentes
 
