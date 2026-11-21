@@ -22,7 +22,8 @@ CREATE TABLE taxas_cambio (
 INSERT INTO taxas_cambio (moeda, mzn_por_unidade) VALUES
   ('MZN',  1.000000),
   ('EUR', 69.500000),
-  ('USD', 63.900000);
+  ('USD', 63.900000),
+  ('ZAR',  3.550000);       -- rand sul-africano (contas de África)
 
 CREATE TABLE contas (
     id              TEXT PRIMARY KEY,
@@ -48,7 +49,7 @@ CREATE TABLE movimentos (
     tx_id               UUID          NOT NULL,
     conta_id            TEXT          NOT NULL REFERENCES contas(id),
     tipo                TEXT          NOT NULL CHECK (tipo IN
-                          ('DEBITO','CREDITO','DEBITO_EXTERNO','COMPENSACAO')),
+                          ('DEBITO','CREDITO','DEBITO_EXTERNO','COMPENSACAO','DEPOSITO')),
     valor               NUMERIC(18,2) NOT NULL CHECK (valor > 0),   -- na moeda da conta
     moeda               CHAR(3)       NOT NULL,
     valor_contraparte   NUMERIC(18,2),                              -- na moeda da outra conta
@@ -67,7 +68,7 @@ CREATE INDEX idx_mov_tx ON movimentos (tx_id);
 -- Utilizador aplicacional com privilégios mínimos (princípio do menor privilégio).
 -- A palavra-passe é definida a partir de um segredo em 20-segredos.sh.
 CREATE ROLE app LOGIN;
-GRANT SELECT, UPDATE ON contas TO app;
+GRANT SELECT, INSERT, UPDATE ON contas TO app;   -- INSERT: o admin abre contas novas
 GRANT SELECT, INSERT ON movimentos TO app;
 GRANT SELECT, UPDATE ON taxas_cambio TO app;
 GRANT USAGE, SELECT ON SEQUENCE movimentos_id_seq TO app;

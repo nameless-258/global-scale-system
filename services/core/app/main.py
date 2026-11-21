@@ -32,7 +32,7 @@ from .dfs import AuditoriaEncadeada, DFSErro, criar_dfs, verificar_cadeia
 from .security import (Utilizador, exigir_admin, sha256_hex, utilizador_atual,
                        verificar_frescura, verificar_integridade)
 from .shards import (ContaInexistente, FragmentoIndisponivel, cifrar_titulares, com_titular,
-                     estado_fragmento, movimentos_de, obter_conta, para_json, scatter_gather)
+                     estado_fragmento, extracto, inspecionar_no, inspecionar_todos, movimentos_de, obter_conta, para_json, scatter_gather)
 from .transacoes import (FALHAS_2PC, FALHAS_SAGA, Coordenador, NaoAutorizado,
                          SaldoInsuficiente, TaxasInconsistentes, TransacaoDuplicada)
 
@@ -128,12 +128,18 @@ class PedidoOrdemExterna(BaseModel):
     valor: str = Field(pattern=r"^\d{1,12}(\.\d{1,2})?$", examples=["150.00"],
                        description="Valor na moeda da conta de origem")
     timestamp: str
+    tipo_destino: Literal["IBAN", "CARTEIRA"] | None = Field(
+        default=None, description="IBAN (outro banco) ou CARTEIRA (M-Pesa, e-Mola, mKesh; "
+                                  "banco_destino = operadora e iban_destino = n.º de telemóvel)")
     hash_sha256: str = Field(min_length=64, max_length=64)
 
     def campos(self) -> dict:
-        return {"id": str(self.id), "conta_origem": self.conta_origem,
-                "banco_destino": self.banco_destino, "iban_destino": self.iban_destino,
-                "valor": self.valor, "timestamp": self.timestamp}
+        c = {"id": str(self.id), "conta_origem": self.conta_origem,
+             "banco_destino": self.banco_destino, "iban_destino": self.iban_destino,
+             "valor": self.valor, "timestamp": self.timestamp}
+        if self.tipo_destino:                      # entra no hash SHA-256 quando é enviado
+            c["tipo_destino"] = self.tipo_destino
+        return c
 
 
 # ============================================================ Endpoints
@@ -167,8 +173,8 @@ def saude():
 def listar_contas(u: Utilizador = Depends(utilizador_atual)):
     """Consulta GLOBAL (scatter-gather paralelo sobre todos os fragmentos)."""
     if u.is_admin:
-        linhas, falhas = scatter_gather("SELECT id, titular, titular_cifrado, regiao, moeda, saldo, "
-                                        "versao FROM contas ORDER BY id")
+        linhas, falhas = scatter_gather("SELECT id, titular, titular_cifrado, owner_username, regiao, "
+                                        "moeda, saldo, versao FROM contas ORDER BY id")
     else:
         linhas, falhas = scatter_gather("SELECT id, titular, titular_cifrado, regiao, moeda, saldo, "
                                         "versao FROM contas WHERE owner_username = %s ORDER BY id",
@@ -178,6 +184,18 @@ def listar_contas(u: Utilizador = Depends(utilizador_atual)):
                                                   for l in linhas],
             "fragmentos_indisponiveis": falhas,
             "resultado_parcial": bool(falhas)}
+
+
+@app.get("/beneficiarios", tags=["contas"])
+def beneficiarios(u: Utilizador = Depends(utilizador_atual)):
+    """Lista de beneficiários: contas de OUTROS clientes para onde se pode transferir
+    (número da conta, nome do titular, moeda e região; sem saldos)."""
+    linhas, falhas = scatter_gather("SELECT id, titular, titular_cifrado, regiao, moeda FROM contas "
+                                    "WHERE owner_username <> %s ORDER BY id", (u.username,))
+    com_titular(linhas)
+    return {"beneficiarios": [{"conta": l["id"], "titular": l["titular"], "moeda": l["moeda"],
+                               "regiao": l["regiao"]} for l in linhas],
+            "fragmentos_indisponiveis": falhas}
 
 
 @app.get("/contas/{conta_id}", tags=["contas"])
@@ -240,6 +258,82 @@ def ordem_interbancaria(pedido: PedidoOrdemExterna,
     hash_ok = verificar_integridade(pedido.campos(), pedido.hash_sha256)
     verificar_frescura(pedido.timestamp)
     return coordenador.ordem_interbancaria(pedido.campos(), u, hash_ok, falha)
+
+
+@app.get("/carteiras/{operadora}/{numero}", tags=["interoperabilidade"])
+def consultar_carteira(operadora: str, numero: str, u: Utilizador = Depends(utilizador_atual)):
+    """Confirma o titular de uma carteira móvel antes de enviar dinheiro (como nas apps bancárias)."""
+    if operadora.upper() not in ("M-PESA", "E-MOLA", "MKESH") or not numero.replace("+", "").isdigit():
+        raise HTTPException(400, "Operadora ou número inválido")
+    try:
+        r = legado.consultar_carteira(operadora.upper(), numero)
+    except Exception as e:
+        raise HTTPException(503, f"A rede interbancária não respondeu: {e}")
+    return {"operadora": r.get("Operadora"), "numero": r.get("Numero"), "estado": r.get("Estado"),
+            "titular": r.get("Titular"), "motivo": r.get("Motivo")}
+
+
+@app.get("/contas/{conta_id}/extracto", tags=["contas"])
+def extracto_conta(conta_id: str, de: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                   ate: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                   u: Utilizador = Depends(utilizador_atual)):
+    """Extrato bancário: débitos, créditos e saldo após cada movimento, num período opcional."""
+    e = extracto(conta_id.upper(), de, ate)
+    if not u.is_admin and e["owner_username"] != u.username:
+        raise HTTPException(403, "Não é titular desta conta")
+    return e
+
+
+# ------------------------------------------------- Administração: bases de dados por nó
+@app.get("/admin/bd", tags=["admin"])
+def bases_de_dados(u: Utilizador = Depends(utilizador_atual)):
+    """Resumo de CADA nó de base de dados (primários e réplicas), lido diretamente em cada um."""
+    exigir_admin(u)
+    return {"lido_por": config.NODE_ID, "nos": inspecionar_todos()}
+
+
+@app.get("/admin/bd/{no}", tags=["admin"])
+def base_de_dados_no(no: str, u: Utilizador = Depends(utilizador_atual)):
+    """Conteúdo de UM nó: contas, últimos movimentos, taxas e transações preparadas,
+    tal como estão guardados (dados pessoais cifrados) e decifrados pela API."""
+    exigir_admin(u)
+    if no not in config.NOS_BD:
+        raise HTTPException(404, "Nó desconhecido")
+    return {"lido_por": config.NODE_ID, **inspecionar_no(no)}
+
+
+# ------------------------------------------------- Administração: contas e depósitos
+class NovaConta(BaseModel):
+    owner_username: str = Field(pattern=r"^[a-z][a-z0-9._-]{2,30}$")
+    titular: str = Field(min_length=3, max_length=80)
+    regiao: Literal["EU", "AM", "AF"]
+    moeda: Literal["MZN", "EUR", "USD", "ZAR"]
+
+
+class Deposito(BaseModel):
+    id: UUID = Field(description="UUID gerado pelo cliente (idempotência)")
+    conta: str
+    valor: str = Field(pattern=r"^\d{1,9}(\.\d{1,2})?$")
+    descricao: str = Field(default="Depósito em numerário", max_length=80)
+
+
+@app.post("/admin/contas", tags=["admin"])
+def abrir_conta(nova: NovaConta, u: Utilizador = Depends(utilizador_atual)):
+    """Abre uma conta para um cliente, no fragmento da região escolhida."""
+    exigir_admin(u)
+    return coordenador.abrir_conta(nova.owner_username, nova.titular.strip(), nova.regiao, nova.moeda, u)
+
+
+@app.post("/admin/depositos", tags=["admin"])
+def depositar(d: Deposito, u: Utilizador = Depends(utilizador_atual)):
+    """Depósito numa conta de cliente (entrada de dinheiro novo). O administrador pode
+    creditar, mas nunca debitar contas de clientes."""
+    exigir_admin(u)
+    from decimal import Decimal
+    valor = Decimal(d.valor)
+    if valor <= 0:
+        raise ValueError("O valor do depósito tem de ser positivo")
+    return coordenador.depositar(str(d.id), d.conta, valor, d.descricao.strip() or "Depósito", u)
 
 
 # ------------------------------------------------- Taxas de câmbio (replicadas)

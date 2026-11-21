@@ -84,6 +84,7 @@ ANA = ADM = None
 @teste("Saúde: fragmentos, réplicas síncronas, HDFS e legado")
 def t_saude():
     s = http.get("/saude").json()
+    assert len(s["fragmentos"]) == 3, f"esperados 3 fragmentos: {list(s['fragmentos'])}"
     for nome, f in s["fragmentos"].items():
         assert f["estado"] == "OK", f"{nome} não está OK"
     assert s["dfs"].get("estado") == "Operational", f"DFS: {s['dfs']}"
@@ -146,6 +147,20 @@ def t_2pc():
     return f"(150 EUR -> {creditado} USD)"
 
 
+@teste("Fragmento África: 2PC Europa -> África e conversão ZAR -> MZN em África")
+def t_africa():
+    antes = total(ADM)
+    a, f = saldo(ADM, "EU-1003"), saldo(ADM, "AF-3001")
+    r = http.post("/transferencias", json=tx("EU-1003", "AF-3001", "500"), headers=ANA).json()
+    assert r["estado"] == "CONFIRMADA" and r["protocolo"].startswith("Two-Phase"), r
+    assert saldo(ADM, "EU-1003") == a - 500 and saldo(ADM, "AF-3001") == f + 500, "saldos errados"
+    assert total(ADM) == antes, "total mudou numa transferência MZN -> MZN"
+    t = token("thabo", "Thabo@2026")
+    r2 = http.post("/transferencias", json=tx("AF-3002", "AF-3001", "100"), headers=t).json()
+    assert r2["estado"] == "CONFIRMADA" and r2["protocolo"].startswith("LOCAL"), r2
+    return f"(500 MZN Europa -> África por 2PC; 100 ZAR -> {r2['conversao']['creditado']} local)"
+
+
 @teste("Conservação: 2PC na mesma moeda (MZN) mantém o total exato")
 def t_conservacao():
     d = token("diego", "Diego@2026")
@@ -176,6 +191,15 @@ def t_fase1():
 def t_autorizacao():
     r = http.post("/transferencias", json=tx("AM-2001", "EU-1001", "1"), headers=ANA)
     assert r.status_code == 403
+
+
+@teste("Separação de funções: o administrador não movimenta contas de clientes (403)")
+def t_admin_nao_debita():
+    r = http.post("/transferencias", json=tx("EU-1001", "EU-1003", "1"), headers=ADM)
+    assert r.status_code == 403, f"HTTP {r.status_code}"
+    r = http.get("/beneficiarios", headers=ANA).json()["beneficiarios"]
+    assert r and all(not b["conta"] in ("EU-1001", "EU-1003") for b in r), "beneficiários incluem contas próprias"
+    return f"{len(r)} beneficiários para a ana"
 
 
 @teste("Integridade: mensagem adulterada recusada (SHA-256)")
@@ -232,6 +256,67 @@ def t_saga_comp():
     assert saldo(ADM, "EU-1001") == antes, "o estorno não repôs o saldo"
 
 
+def ordem(conta, destino, numero, valor, tipo="CARTEIRA"):
+    c = {"id": str(uuid.uuid4()), "conta_origem": conta, "banco_destino": destino,
+         "iban_destino": numero, "valor": f"{Decimal(valor):.2f}", "timestamp": agora(),
+         "tipo_destino": tipo}
+    return {**c, "hash_sha256": canon(c)}
+
+
+@teste("Carteira móvel: envio para M-Pesa com confirmação do titular [Saga]")
+def t_carteira():
+    q = http.get("/carteiras/M-PESA/841234567", headers=ANA).json()
+    assert q["estado"] == "ATIVA" and q["titular"], q
+    r = http.post("/interbancario/ordens", json=ordem("EU-1003", "M-PESA", "841234567", "250"), headers=ANA).json()
+    assert r["estado"] == "CONCLUIDA" and r["titular_destino"] == q["titular"], r
+    r2 = http.post("/interbancario/ordens", json=ordem("EU-1001", "E-MOLA", "861234567", "10"), headers=ANA).json()
+    assert r2["estado"] == "CONCLUIDA" and r2["enviado"] == "695.00 MZN", r2
+    return f"(250 MZN para {q['titular']}; 10 EUR -> {r2['enviado']} para e-Mola)"
+
+
+@teste("Carteira móvel: número sem carteira é recusado e o dinheiro devolvido")
+def t_carteira_invalida():
+    antes = saldo(ADM, "EU-1003")
+    r = http.post("/interbancario/ordens", json=ordem("EU-1003", "M-PESA", "849999999", "100"), headers=ANA).json()
+    assert r["estado"] == "COMPENSADA", r
+    assert saldo(ADM, "EU-1003") == antes, "a compensação não repôs o saldo"
+
+
+@teste("Extrato: débitos, créditos e saldo após cada movimento coerentes")
+def t_extracto():
+    e = http.get("/contas/EU-1003/extracto", headers=ANA).json()
+    assert e["movimentos"], "extrato vazio"
+    assert e["saldo_final"] == e["saldo_atual"] == e["movimentos"][-1]["saldo_apos"], e
+    s0 = Decimal(e["saldo_inicial"])
+    for m in e["movimentos"]:
+        s0 += Decimal(m["credito"] or 0) - Decimal(m["debito"] or 0)
+        assert s0 == Decimal(m["saldo_apos"]), f"saldo após errado em {m}"
+    assert http.get("/contas/AM-2001/extracto", headers=ANA).status_code == 403, "extrato alheio visível"
+    return f"({len(e['movimentos'])} movimentos, saldo {e['saldo_atual']} MZN)"
+
+
+@teste("Administração: criar cliente, abrir conta e depositar")
+def t_admin_cliente():
+    u = f"teste{uuid.uuid4().hex[:6]}"
+    r = http.post(f"{AUTH}/auth/utilizadores", json={"username": u, "nome": "Cliente de Teste",
+                                                     "password": "Teste2026x"}, headers=ADM)
+    assert r.status_code == 201, r.text[:200]
+    assert http.post(f"{AUTH}/auth/utilizadores", json={"username": u + "b", "nome": "X Y Z",
+                     "password": "Teste2026x"}, headers=ANA).status_code == 403, "cliente criou utilizador"
+    c = http.post("/admin/contas", json={"owner_username": u, "titular": "Cliente de Teste",
+                                         "regiao": "AF", "moeda": "MZN"}, headers=ADM).json()
+    assert c["conta"].startswith("AF-"), c
+    dep = {"id": str(uuid.uuid4()), "conta": c["conta"], "valor": "1000.00", "descricao": "Abertura"}
+    assert http.post("/admin/depositos", json=dep, headers=ANA).status_code == 403, "cliente depositou"
+    d = http.post("/admin/depositos", json=dep, headers=ADM).json()
+    assert d["estado"] == "CONFIRMADA" and d["saldo_atual"] == "1000.00", d
+    assert http.post("/admin/depositos", json=dep, headers=ADM).status_code == 409, "depósito repetido aceite"
+    novo = token(u, "Teste2026x")
+    contas = http.get("/contas", headers=novo).json()["contas"]
+    assert [x["id"] for x in contas] == [c["conta"]] and contas[0]["saldo"] == "1000.00", contas
+    return f"({u} com {c['conta']} e 1000.00 MZN)"
+
+
 @teste("DFS: relatório escrito no HDFS e lido de volta (SHA-256 igual)")
 def t_hdfs():
     g = http.post("/relatorios", headers=ADM).json()
@@ -253,9 +338,13 @@ def t_auditoria():
 
 @teste("Concorrência: 30 transferências 2PC em paralelo nos dois sentidos")
 def t_concorrencia():
+    # cada titular movimenta a SUA conta: Ana (EU-1003, MZN) e Diego (AM-2002, MZN),
+    # em sentidos opostos e ao mesmo tempo (o administrador não pode movimentar contas)
+    diego = token("diego", "Diego@2026")
     def uma(i):
-        o, d = ("EU-1001", "AM-2001") if i % 2 else ("AM-2001", "EU-1001")
-        return http.post("/transferencias", json=tx(o, d, "1"), headers=ADM).status_code
+        if i % 2:
+            return http.post("/transferencias", json=tx("EU-1003", "AM-2002", "1"), headers=ANA).status_code
+        return http.post("/transferencias", json=tx("AM-2002", "EU-1003", "1"), headers=diego).status_code
     with ThreadPoolExecutor(10) as ex:
         codigos = list(ex.map(uma, range(30)))
     assert codigos.count(200) == 30, f"códigos: {codigos}"
@@ -274,8 +363,9 @@ def t_replicas():
 if __name__ == "__main__":
     print(f"\n{AZUL}Global-Scale System — testes automáticos contra {URL}{FIM}\n")
     for t in [t_saude, t_login, t_password, t_sem_token, t_token_forjado, t_cifragem, t_local,
-              t_2pc, t_conservacao, t_saldo, t_fase1, t_autorizacao, t_adulterada, t_replay,
-              t_expirada, t_taxas, t_taxa_update, t_saga_ok, t_saga_comp, t_hdfs, t_auditoria,
+              t_2pc, t_africa, t_conservacao, t_saldo, t_fase1, t_autorizacao, t_admin_nao_debita, t_adulterada, t_replay,
+              t_expirada, t_taxas, t_taxa_update, t_saga_ok, t_saga_comp, t_carteira, t_carteira_invalida,
+              t_extracto, t_admin_cliente, t_hdfs, t_auditoria,
               t_concorrencia, t_replicas]:
         t()
     ok = sum(1 for _, p, _ in resultados if p)

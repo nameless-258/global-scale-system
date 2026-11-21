@@ -6,20 +6,17 @@
 #  DB_ROLE       primario | replica
 #  DB_PRIMARIO   (réplica) nó primário de onde copiar os dados
 #  DB_APP_NAME   (réplica) nome com que a réplica se apresenta ao primário
+#  DB_PARCEIRO   o outro nó do mesmo fragmento (por omissão = DB_PRIMARIO)
 #
-# FENCING: se a sentinela promoveu a réplica, o antigo primário fica "vedado"
-# (ficheiro /fence/<nó>.vedado) e recusa-se a arrancar como primário. Isto
-# evita o "split-brain" (dois primários a aceitar escritas ao mesmo tempo).
+# FENCING + REINTEGRAÇÃO: se a sentinela promoveu o parceiro, este nó fica
+# "vedado" (/fence/<nó>.vedado) e NUNCA volta a arrancar como primário (evita o
+# split-brain). Em vez disso, apaga os seus dados, faz uma cópia base nova a
+# partir do novo primário e volta como RÉPLICA. Não se perde nada: a replicação
+# era síncrona, por isso o novo primário já tem todas as transações confirmadas.
 # =============================================================================
 set -e
 NODE="${DB_NODE_NAME:?defina DB_NODE_NAME}"
 ROLE="${DB_ROLE:-primario}"
-
-if [ -f "/fence/${NODE}.vedado" ]; then
-  echo "[fencing] ${NODE} foi substituído pela réplica promovida."
-  echo "[fencing] Não arranca como primário (evita split-brain). Para reintegrar: scripts/reset-alta-disponibilidade.sh"
-  exec sleep infinity
-fi
 
 # Certificado TLS do nó, com as permissões exigidas pelo PostgreSQL
 TLS=/var/lib/postgresql/tls
@@ -35,6 +32,21 @@ printf '*:*:*:replicador:%s\n' "$(cat /certs/privado/replicador_password)" > /va
 chown postgres:postgres /var/lib/postgresql/.pgpass
 chmod 600 /var/lib/postgresql/.pgpass
 
+PARCEIRO="${DB_PARCEIRO:-$DB_PRIMARIO}"
+APP="${DB_APP_NAME:-${NODE//-/_}}"
+
+if [ -f "/fence/${NODE}.vedado" ]; then
+  echo "[fencing] ${NODE} foi substituído por ${PARCEIRO}: não volta a arrancar como primário (evita split-brain)."
+  echo "[reintegração] ${NODE} volta como RÉPLICA de ${PARCEIRO} (cópia base nova; a replicação era síncrona, nada se perde)."
+  until pg_isready -h "$PARCEIRO" -p 5432 -q; do sleep 2; done
+  rm -rf "${PGDATA:?}"/* "${PGDATA:?}"/.[!.]* 2>/dev/null || true
+  mkdir -p "$PGDATA"; chown postgres:postgres "$PGDATA"; chmod 700 "$PGDATA"
+  su-exec postgres pg_basebackup -D "$PGDATA" -X stream -R --checkpoint=fast \
+    -d "host=${PARCEIRO} port=5432 user=replicador sslmode=verify-full sslrootcert=${TLS}/ca.crt application_name=${APP}"
+  rm -f "/fence/${NODE}.vedado"
+  echo "[reintegração] ${NODE} é agora réplica de ${PARCEIRO} (streaming replication)."
+fi
+
 if [ "$ROLE" = "replica" ] && [ ! -s "$PGDATA/PG_VERSION" ]; then
   echo "[réplica] À espera do primário ${DB_PRIMARIO}..."
   until pg_isready -h "$DB_PRIMARIO" -p 5432 -q; do sleep 2; done
@@ -44,7 +56,7 @@ if [ "$ROLE" = "replica" ] && [ ! -s "$PGDATA/PG_VERSION" ]; then
   chmod 700 "$PGDATA"
   echo "[réplica] Cópia base (pg_basebackup) a partir de ${DB_PRIMARIO}, por TLS..."
   su-exec postgres pg_basebackup -D "$PGDATA" -X stream -R --checkpoint=fast \
-    -d "host=${DB_PRIMARIO} port=5432 user=replicador sslmode=verify-full sslrootcert=${TLS}/ca.crt application_name=${DB_APP_NAME}"
+    -d "host=${DB_PRIMARIO} port=5432 user=replicador sslmode=verify-full sslrootcert=${TLS}/ca.crt application_name=${APP}"
   echo "[réplica] Pronta: arranca em modo standby (streaming replication)."
 fi
 

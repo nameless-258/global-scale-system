@@ -27,6 +27,20 @@
     "iteracoes": 310000,
     "hash": "a70ad3557f752245931dbd24c80742639012a2d9b9705feb235804c1db50b3d5"
   },
+  "fatima": {
+    "nome": "Fátima Langa",
+    "papel": "cliente",
+    "salt": "ce69eb1d86b4344bc8bac0a19fb55180",
+    "iteracoes": 310000,
+    "hash": "837f511fb85fd2d6f6bbea5ff49988ded1574ed2376dc139c1dba36a9d6552ea"
+  },
+  "thabo": {
+    "nome": "Thabo Nkosi",
+    "papel": "cliente",
+    "salt": "07ce1088ef61dbb4df1a283bce621633",
+    "iteracoes": 310000,
+    "hash": "66203c4c2378401892a31625aafff888e34e9c016b84b6a71832eee3383a24ef"
+  },
   "admin": {
     "nome": "Administrador",
     "papel": "admin",

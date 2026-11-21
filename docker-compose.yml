@@ -1,7 +1,8 @@
 # =============================================================================
 #  GLOBAL-SCALE SYSTEM — Plataforma financeira distribuída e resiliente
 #  Arranque:   docker compose up -d --build
-#  Gateway:    https://localhost:8443/docs     HDFS UI: http://localhost:9870
+#  Interface:  https://localhost:8443/ui/     API: https://localhost:8443/docs
+#  HDFS UI:    http://localhost:9870
 #
 #  Segredos: cada serviço monta apenas certs/publico (CA e chaves públicas) e a
 #  SUA pasta certs/<serviço> (chaves privadas e palavras-passe). Ver gen-certs.sh.
@@ -15,6 +16,7 @@ x-api: &api
     certs:      { condition: service_completed_successfully }
     db-europa:  { condition: service_healthy }
     db-america: { condition: service_healthy }
+    db-africa:  { condition: service_healthy }
     namenode:   { condition: service_started }
 
 x-api-env: &api-env
@@ -61,6 +63,7 @@ services:
       POSTGRES_DB: banco
       DB_NODE_NAME: db-europa
       DB_ROLE: primario
+      DB_PARCEIRO: db-europa-r
     volumes:
       - ./certs/publico:/certs/publico:ro
       - ./certs/db-europa:/certs/privado:ro
@@ -105,6 +108,7 @@ services:
       POSTGRES_DB: banco
       DB_NODE_NAME: db-america
       DB_ROLE: primario
+      DB_PARCEIRO: db-america-r
     volumes:
       - ./certs/publico:/certs/publico:ro
       - ./certs/db-america:/certs/privado:ro
@@ -138,6 +142,51 @@ services:
     networks:
       global-net: { ipv4_address: 172.28.0.44 }
 
+  # Fragmento C — África (contas AF-*): primário + réplica síncrona
+  db-africa:
+    <<: *postgres
+    hostname: db-africa
+    depends_on:
+      certs: { condition: service_completed_successfully }
+    environment:
+      POSTGRES_PASSWORD_FILE: /certs/privado/postgres_password
+      POSTGRES_DB: banco
+      DB_NODE_NAME: db-africa
+      DB_ROLE: primario
+      DB_PARCEIRO: db-africa-r
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/db-africa:/certs/privado:ro
+      - ./db/entrypoint.sh:/db/entrypoint.sh:ro
+      - ./db/00-pg-hba.sh:/docker-entrypoint-initdb.d/00-pg-hba.sh:ro
+      - ./db/schema.inc:/docker-entrypoint-initdb.d/schema.inc:ro
+      - ./db/init-africa.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./db/20-segredos.sh:/docker-entrypoint-initdb.d/20-segredos.sh:ro
+      - pg-africa:/var/lib/postgresql/data
+      - fencing:/fence
+    networks:
+      global-net: { ipv4_address: 172.28.0.47 }
+
+  db-africa-r:
+    <<: *postgres
+    hostname: db-africa-r
+    depends_on:
+      db-africa: { condition: service_healthy }
+    environment:
+      POSTGRES_PASSWORD_FILE: /certs/privado/postgres_password
+      DB_NODE_NAME: db-africa-r
+      DB_ROLE: replica
+      DB_PRIMARIO: db-africa
+      DB_APP_NAME: db_africa_r
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/db-africa-r:/certs/privado:ro
+      - ./db/entrypoint.sh:/db/entrypoint.sh:ro
+      - pg-africa-r:/var/lib/postgresql/data
+      - fencing:/fence
+    networks:
+      global-net: { ipv4_address: 172.28.0.48 }
+
   # Sentinela: gere a replicação síncrona e faz o failover automático
   sentinela:
     build: ./services/core
@@ -147,12 +196,33 @@ services:
     depends_on:
       db-europa:  { condition: service_healthy }
       db-america: { condition: service_healthy }
+      db-africa:  { condition: service_healthy }
     volumes:
       - ./certs/publico:/certs/publico:ro
       - ./certs/sentinela:/certs/privado:ro
       - fencing:/fence
     networks:
       global-net: { ipv4_address: 172.28.0.45 }
+
+  # ------------------------------------------ Controlo de falhas (demonstração)
+  # Usado pela interface web para derrubar/religar nós. Só aceita JWT de admin
+  # e uma lista fechada de serviços e ações (ver services/core/app/controlo.py).
+  controlo:
+    build: ./services/core
+    hostname: controlo
+    restart: unless-stopped
+    command: ["sh", "-c", "uvicorn app.controlo:app --host 0.0.0.0 --port 8443 --ssl-keyfile /certs/privado/tls.key --ssl-certfile /certs/privado/tls.crt"]
+    depends_on:
+      certs: { condition: service_completed_successfully }
+    environment:
+      COMPOSE_PROJECT: global-scale-system
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/controlo:/certs/privado:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - coordenador-data:/data          # só para reativar uma API desativada
+    networks:
+      global-net: { ipv4_address: 172.28.0.46 }
 
   # ------------------------------------------ Sistema de Ficheiros Distribuído
   namenode:                           # metadados do HDFS
@@ -192,6 +262,7 @@ services:
     volumes:
       - ./certs/publico:/certs/publico:ro
       - ./certs/auth:/certs/privado:ro          # só este nó tem a chave privada JWT
+      - auth-data:/data                         # clientes criados pelo administrador
     networks:
       global-net: { ipv4_address: 172.28.0.11 }
 
@@ -244,6 +315,7 @@ services:
       - "8080:80"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ui:/usr/share/nginx/ui:ro
       - ./certs/publico:/certs/publico:ro
       - ./certs/gateway:/certs/privado:ro
     networks:
@@ -277,7 +349,10 @@ volumes:
   pg-europa-r:
   pg-america:
   pg-america-r:
+  pg-africa:
+  pg-africa-r:
   coordenador-data:
   legacy-data:
   fencing:
   cliente-token:
+  auth-data:

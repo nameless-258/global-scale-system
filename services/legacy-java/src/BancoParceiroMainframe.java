@@ -59,8 +59,23 @@ public class BancoParceiroMainframe {
     private static final Map<String, BigDecimal> LIMITE_POR_ORDEM = Map.of(
             "MZN", new BigDecimal("1000000.00"),
             "EUR", new BigDecimal("15000.00"),
-            "USD", new BigDecimal("15000.00"));
+            "USD", new BigDecimal("15000.00"),
+            "ZAR", new BigDecimal("250000.00"));
     private static final Pattern IBAN = Pattern.compile("^[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}$");
+
+    // ---- Carteiras móveis (a rede interbancária também liga às operadoras, como a SIMO)
+    // Número moçambicano: 9 dígitos a começar por 82-87. Cada operadora tem os seus prefixos.
+    private static final Pattern NUMERO_MOVEL = Pattern.compile("^8[2-7][0-9]{7}$");
+    private static final Map<String, java.util.List<String>> PREFIXOS = Map.of(
+            "M-PESA", java.util.List.of("84", "85"),
+            "E-MOLA", java.util.List.of("86", "87"),
+            "MKESH", java.util.List.of("82", "83"));
+    private static final BigDecimal LIMITE_CARTEIRA = new BigDecimal("250000.00");   // MZN por operação
+    // Carteiras registadas no simulador (número -> titular), para a confirmação do nome
+    private static final Map<String, String> CARTEIRAS = Map.of(
+            "841234567", "Joana Mabunda", "851112233", "Carlos Tembe",
+            "861234567", "Luísa Cumbe", "871112233", "Rui Macuácua",
+            "821234567", "Sónia Bila", "831112233", "Pedro Nhaca");
     private static final Map<String, Map<String, String>> ORDENS = new ConcurrentHashMap<>();
     private static final AtomicLong SEQ = new AtomicLong(700000);
     private static PublicKey chaveNucleo;
@@ -87,6 +102,7 @@ public class BancoParceiroMainframe {
         srv.setExecutor(Executors.newFixedThreadPool(8));
         srv.createContext("/mainframe/saude", BancoParceiroMainframe::saude);
         srv.createContext("/mainframe/ordens", BancoParceiroMainframe::ordens);
+        srv.createContext("/mainframe/carteiras", BancoParceiroMainframe::carteiras);
         srv.start();
         log("Mainframe do Banco Parceiro (Java " + System.getProperty("java.version")
                 + ") a escutar em HTTPS :" + porta);
@@ -100,6 +116,34 @@ public class BancoParceiroMainframe {
         r.put("Estado", "OK");
         r.put("OrdensRegistadas", String.valueOf(ORDENS.size()));
         responder(ex, 200, xml("Saude", r));
+    }
+
+    /** GET /mainframe/carteiras/{OPERADORA}/{numero}: confirma o titular de uma carteira móvel. */
+    private static void carteiras(HttpExchange ex) throws IOException {
+        String[] p = ex.getRequestURI().getPath().split("/");
+        Map<String, String> r = new LinkedHashMap<>();
+        if (!"GET".equals(ex.getRequestMethod()) || p.length != 5) { responder(ex, 400, erro("-", "Pedido inválido")); return; }
+        String op = p[3].toUpperCase(), num = normalizarNumero(p[4]);
+        r.put("Operadora", op); r.put("Numero", num);
+        String motivo = validarCarteira(op, num);
+        if (motivo == null) { r.put("Estado", "ATIVA"); r.put("Titular", CARTEIRAS.get(num)); }
+        else { r.put("Estado", "INVALIDA"); r.put("Motivo", motivo); }
+        responder(ex, 200, xml("Carteira", r));
+    }
+
+    private static String normalizarNumero(String n) {
+        String d = n.replaceAll("[^0-9]", "");
+        return d.startsWith("258") && d.length() == 12 ? d.substring(3) : d;
+    }
+
+    /** Devolve null se a carteira é válida, ou o motivo da recusa. */
+    private static String validarCarteira(String operadora, String numero) {
+        if (!PREFIXOS.containsKey(operadora)) return "Operadora desconhecida: " + operadora;
+        if (!NUMERO_MOVEL.matcher(numero).matches()) return "Número de telemóvel inválido";
+        if (!PREFIXOS.get(operadora).contains(numero.substring(0, 2)))
+            return "O número " + numero + " não pertence à " + operadora;
+        if (!CARTEIRAS.containsKey(numero)) return "O número " + numero + " não tem carteira " + operadora;
+        return null;
     }
 
     private static void ordens(HttpExchange ex) throws IOException {
@@ -163,10 +207,25 @@ public class BancoParceiroMainframe {
         Map<String, String> r = new LinkedHashMap<>();
         r.put("Referencia", ref);
         BigDecimal valor = new BigDecimal(o.getOrDefault("Valor", "0"));
+        String banco = o.getOrDefault("BancoDestino", "").toUpperCase();
         String iban = o.getOrDefault("IbanDestino", "").replace(" ", "").toUpperCase();
         String moeda = o.getOrDefault("Moeda", "MZN").toUpperCase();
         BigDecimal limite = LIMITE_POR_ORDEM.get(moeda);
-        if (!IBAN.matcher(iban).matches()) {
+        if (PREFIXOS.containsKey(banco)) {                       // ---- carteira móvel
+            iban = normalizarNumero(o.getOrDefault("NumeroCarteira", ""));
+            String motivo = validarCarteira(banco, iban);
+            if (motivo == null && !"MZN".equals(moeda)) motivo = "As carteiras móveis só recebem meticais";
+            if (motivo == null && valor.compareTo(LIMITE_CARTEIRA) > 0)
+                motivo = "Valor excede o limite da carteira (" + LIMITE_CARTEIRA.toPlainString() + " MZN)";
+            if (motivo != null) { r.put("Estado", "REJEITADA"); r.put("Motivo", motivo); }
+            else {
+                r.put("Estado", "ACEITE");
+                r.put("CodigoAutorizacao", "MF" + SEQ.incrementAndGet());
+                r.put("Motivo", "");
+                r.put("Titular", CARTEIRAS.get(iban));
+            }
+            r.put("Operadora", banco);
+        } else if (!IBAN.matcher(iban).matches()) {
             r.put("Estado", "REJEITADA"); r.put("Motivo", "IBAN de destino inválido");
         } else if (limite == null) {
             r.put("Estado", "REJEITADA"); r.put("Motivo", "Moeda não suportada: " + moeda);

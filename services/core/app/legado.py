@@ -58,6 +58,14 @@ def enviar_ordem(campos: dict) -> dict:
     return dados
 
 
+def consultar_carteira(operadora: str, numero: str) -> dict:
+    """Confirmação do titular de uma carteira móvel (M-Pesa, e-Mola, mKesh) na rede interbancária."""
+    r = _http.get(f"{config.LEGACY_URL}/mainframe/carteiras/{operadora}/{numero}")
+    r.raise_for_status()
+    _verificar_digest(r)
+    return de_xml(r.content)
+
+
 def consultar_ordem(referencia: str) -> dict | None:
     r = _http.get(f"{config.LEGACY_URL}/mainframe/ordens/{referencia}")
     if r.status_code == 404:

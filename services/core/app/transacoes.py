@@ -44,7 +44,8 @@ import psycopg
 
 from . import config, legado
 from .cripto import cifrar, ctx_contraparte
-from .shards import ContaInexistente, FragmentoIndisponivel, ligar, shard_de
+from .security import sha256_hex
+from .shards import ESPERA_FAILOVER_S, ContaInexistente, FragmentoIndisponivel, ligar, shard_de
 
 
 # --------------------------------------------------------------- Exceções
@@ -154,9 +155,13 @@ def bloquear_conta(c, conta: str, papel: str) -> dict:
 
 
 def verificar_debito(linha: dict, valor: Decimal, utilizador) -> None:
-    if not utilizador.is_admin and linha["owner_username"] != utilizador.username:
+    # Só o TITULAR movimenta a sua conta. O administrador supervisiona (totais,
+    # taxas, auditoria, recuperação), mas não tem poder para mexer no dinheiro
+    # dos clientes: separação de funções.
+    if linha["owner_username"] != utilizador.username:
         raise NaoAutorizado(f"O utilizador '{utilizador.username}' não é titular da conta "
-                            f"{linha['id']}")
+                            f"{linha['id']}" + (" (o administrador não movimenta contas de clientes)"
+                                               if utilizador.is_admin else ""))
     if linha["saldo"] < valor:
         raise SaldoInsuficiente(f"Saldo insuficiente em {linha['id']}: disponível "
                                 f"{linha['saldo']} {linha['moeda']}, pedido {valor} {linha['moeda']}")
@@ -222,7 +227,7 @@ class Coordenador:
 
     # --------------------------------------------------- Transação local
     def _transferencia_local(self, tx_id, origem, destino, valor, shard, utilizador, hash_tx):
-        with ligar(shard) as c:
+        with ligar(shard, esperar=ESPERA_FAILOVER_S) as c:
             with c.transaction():
                 linhas = {conta: bloquear_conta(c, conta, "origem" if conta == origem else "destino")
                           for conta in sorted([origem, destino])}     # ordem global de bloqueio
@@ -269,7 +274,7 @@ class Coordenador:
                     if falha == "participante_indisponivel_fase1" and i == 1:
                         r(f"⚡ FALHA INJETADA: participante {shard} inacessível (timeout de rede)")
                         raise FragmentoIndisponivel(shard, FalhaSimulada("timeout de rede simulado"))
-                    c = ligar(shard)
+                    c = ligar(shard, esperar=ESPERA_FAILOVER_S)   # espera por um failover em curso
                     conexoes[shard] = c
                     c.tpc_begin(c.xid(self.FORMAT_ID, gtrid, shard))
                     linhas[conta] = bloquear_conta(c, conta, p)
@@ -477,29 +482,39 @@ class Coordenador:
             raise ValueError("O valor tem de ser positivo")
         shard = shard_de(conta)
         rasto = []
+        carteira = (o.get("tipo_destino") or "IBAN").upper() == "CARTEIRA"
         contraparte = f"{o['banco_destino']}:{o['iban_destino']}"
 
         # ---- T1: débito local (transação ACID local, confirmada)
-        with ligar(shard) as c:
+        conv = None
+        with ligar(shard, esperar=ESPERA_FAILOVER_S) as c:
             with c.transaction():
                 linha = bloquear_conta(c, conta, "origem")
                 verificar_debito(linha, valor, utilizador)
+                if carteira and linha["moeda"] != "MZN":
+                    # As carteiras móveis só recebem meticais: converte-se com a taxa
+                    # da tabela replicada, lida dentro desta transação (FOR SHARE).
+                    conv = converter(valor, linha["moeda"], "MZN", ler_taxas(c, [linha["moeda"], "MZN"]))
                 movimentar(c, conta, "DEBITO_EXTERNO", valor, linha["moeda"], tx_id, contraparte,
-                           hash_tx, "SAGA")
+                           hash_tx, "SAGA", conv=conv)
         moeda = linha["moeda"]
+        valor_envio, moeda_envio = (conv["valor_destino"], "MZN") if conv else (valor, moeda)
         self.saga_log.escrever(tx_id, "T1_DEBITO_OK", conta=conta, valor=str(valor), moeda=moeda,
                                shard=shard, contraparte=contraparte, hash=hash_tx)
-        rasto.append(f"SAGA T1: débito de {valor} {moeda} em {conta} confirmado em {shard}")
+        rasto.append(f"SAGA T1: débito de {valor} {moeda} em {conta} confirmado em {shard}"
+                     + (f" (convertido para {valor_envio} MZN)" if conv else ""))
 
         # ---- T2: mensagem XML assinada para o sistema legado (Java)
         motivo = None
         try:
             if falha == "legado_indisponivel":
                 raise ConnectionError("⚡ FALHA INJETADA: mainframe legado não responde")
+            destino = ({"NumeroCarteira": o["iban_destino"]} if carteira
+                       else {"IbanDestino": o["iban_destino"]})
             resp = legado.enviar_ordem({
                 "Referencia": tx_id, "ContaOrigem": conta, "BancoDestino": o["banco_destino"],
-                "IbanDestino": o["iban_destino"], "Valor": f"{valor:.2f}",
-                "Moeda": moeda, "Ordenante": utilizador.username,
+                **destino, "Valor": f"{valor_envio:.2f}",
+                "Moeda": moeda_envio, "Ordenante": utilizador.username,
                 "DataHora": o["timestamp"]})
             rasto.append(f"SAGA T2: legado respondeu {resp.get('Estado')} "
                          f"(XML verificado, assinatura aceite)")
@@ -509,6 +524,9 @@ class Coordenador:
                                         valor=str(valor), moeda=moeda, hash=hash_tx,
                                         autorizacao=resp.get("CodigoAutorizacao"))
                 return {"tx_id": tx_id, "estado": "CONCLUIDA", "protocolo": "SAGA",
+                        "destino_tipo": "CARTEIRA" if carteira else "IBAN",
+                        "titular_destino": resp.get("Titular"),
+                        "enviado": f"{valor_envio:.2f} {moeda_envio}",
                         "resposta_legado": resp, "rasto": rasto}
             motivo = f"Rejeitada pelo banco parceiro: {resp.get('Motivo')}"
         except Exception as e:
@@ -520,6 +538,56 @@ class Coordenador:
         rasto.append(f"SAGA C1: compensação executada — {valor} {moeda} devolvido a {conta}")
         return {"tx_id": tx_id, "estado": "COMPENSADA", "protocolo": "SAGA", "motivo": motivo,
                 "rasto": rasto}
+
+    # ---------------------------------------------- Operações do administrador
+    def depositar(self, tx_id: str, conta: str, valor: Decimal, descricao: str, utilizador) -> dict:
+        """Depósito (entrada de dinheiro novo, por exemplo ao balcão). Só o administrador.
+        Transação ACID local no fragmento da conta; o movimento fica no extrato e na auditoria."""
+        if not utilizador.is_admin:
+            raise NaoAutorizado("Só o administrador pode registar depósitos")
+        conta = conta.upper()
+        shard = shard_de(conta)
+        campos = {"id": tx_id, "conta": conta, "valor": f"{valor:.2f}", "descricao": descricao,
+                  "por": utilizador.username}
+        hash_tx = sha256_hex(json.dumps(campos, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=False).encode())
+        with ligar(shard, esperar=ESPERA_FAILOVER_S) as c:
+            with c.transaction():
+                linha = bloquear_conta(c, conta, "destino")
+                movimentar(c, conta, "DEPOSITO", valor, linha["moeda"], tx_id,
+                           f"DEPOSITO:{descricao}", hash_tx, "LOCAL")
+                saldo = c.execute("SELECT saldo FROM contas WHERE id = %s", (conta,)).fetchone()["saldo"]
+        self.auditoria.registar("DEPOSITO", tx_id=tx_id, conta=conta, valor=str(valor),
+                                moeda=linha["moeda"], por=utilizador.username, hash=hash_tx)
+        return {"tx_id": tx_id, "estado": "CONFIRMADA", "protocolo": "LOCAL (depósito)",
+                "conta": conta, "valor": f"{valor:.2f}", "moeda": linha["moeda"],
+                "saldo_atual": str(saldo), "fragmento": config.SHARD_NOMES[shard]}
+
+    def abrir_conta(self, owner: str, titular: str, regiao: str, moeda: str, utilizador) -> dict:
+        """Abre uma conta nova no fragmento da região (só o administrador)."""
+        from .cripto import ctx_titular
+        if not utilizador.is_admin:
+            raise NaoAutorizado("Só o administrador pode abrir contas")
+        regiao, moeda = regiao.upper(), moeda.upper()
+        if regiao not in config.SHARDS:
+            raise ValueError(f"Região desconhecida: {regiao}")
+        base = {"EU": 1000, "AM": 2000, "AF": 3000}.get(regiao, 9000)
+        with ligar(regiao) as c:
+            with c.transaction():
+                # bloqueio consultivo: dois administradores não geram o mesmo número
+                c.execute("SELECT pg_advisory_xact_lock(4242)")
+                if not c.execute("SELECT 1 FROM taxas_cambio WHERE moeda = %s", (moeda,)).fetchone():
+                    raise ValueError(f"Moeda não suportada: {moeda}")
+                ult = c.execute("SELECT max(split_part(id, '-', 2)::int) AS n FROM contas").fetchone()["n"]
+                numero = max(ult or base, base) + 1
+                conta = f"{regiao}-{numero}"
+                c.execute("INSERT INTO contas (id, titular, titular_cifrado, owner_username, regiao, "
+                          "moeda, saldo) VALUES (%s, NULL, %s, %s, %s, %s, 0)",
+                          (conta, cifrar(titular, ctx_titular(conta)), owner, regiao, moeda))
+        self.auditoria.registar("CONTA_ABERTA", conta=conta, titular_cifrado=True, owner=owner,
+                                moeda=moeda, por=utilizador.username)
+        return {"conta": conta, "titular": titular, "owner_username": owner, "regiao": regiao,
+                "moeda": moeda, "saldo": "0.00", "fragmento": config.SHARD_NOMES[regiao]}
 
     def _compensar(self, tx_id, conta, valor, shard, contraparte, hash_tx, motivo):
         try:

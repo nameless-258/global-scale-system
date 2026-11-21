@@ -176,8 +176,9 @@ def c_ler_relatorio(a):
 def c_carga(a):
     """Teste de concorrência: N transferências cruzadas em paralelo (threads)."""
     from concurrent.futures import ThreadPoolExecutor
-    pares = [("EU-1001", "AM-2001"), ("AM-2001", "EU-1001")] if a.admin_mode else \
-        [("EU-1001", "AM-2001")]
+    # Só o titular movimenta as suas contas (o admin não pode), por isso a carga
+    # usa as contas do utilizador com sessão: por omissão a ana (EU-1001 -> AM-2001).
+    pares = [(a.origem, a.destino)]
     def uma(i):
         o, d = pares[i % len(pares)]
         with http() as h:
@@ -228,8 +229,8 @@ def main():
     s.add_parser("recuperar").set_defaults(f=c_post("/admin/recuperar"))
     x = s.add_parser("carga", help="teste de concorrência")
     x.add_argument("--n", type=int, default=20); x.add_argument("--paralelo", type=int, default=10)
-    x.add_argument("--valor", default="1.00"); x.add_argument("--admin-mode", action="store_true",
-                                                             help="transferências nos dois sentidos (requer admin)")
+    x.add_argument("--valor", default="1.00")
+    x.add_argument("--origem", default="EU-1001"); x.add_argument("--destino", default="AM-2001")
     x.set_defaults(f=c_carga)
     a = p.parse_args()
     try:

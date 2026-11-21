@@ -33,20 +33,42 @@ def _segredo(nome: str, env: str | None = None) -> str:
 # um PRIMÁRIO e uma RÉPLICA; a cadeia de ligação lista os dois e o libpq escolhe
 # o que aceita escritas (target_session_attrs=read-write). Depois de uma
 # promoção feita pela sentinela, a aplicação passa automaticamente para a réplica.
+# IP fixo de cada nó na rede global-net. Liga-se pelo IP (hostaddr) e verifica-se o
+# certificado pelo NOME (host): quando um nó está parado, o seu nome deixa de existir
+# no DNS do Docker e cada resolução demoraria segundos; pelo IP, a falha é imediata.
+DB_IPS = {"db-europa": "172.28.0.41", "db-america": "172.28.0.42", "db-europa-r": "172.28.0.43",
+          "db-america-r": "172.28.0.44", "db-africa": "172.28.0.47", "db-africa-r": "172.28.0.48",
+          **dict(e.split("=", 1) for e in os.getenv("DB_IPS", "").split(",") if "=" in e)}
+
+
 def _dsn(prefixo: str, primario: str, replica: str) -> str:
     hosts = os.getenv(f"DB_{prefixo}_HOSTS", f"{primario},{replica}")
     portas = os.getenv(f"DB_{prefixo}_PORTS", "5432,5432")
-    return (f"host={hosts} port={portas} dbname={os.getenv('DB_NAME', 'banco')} "
+    ips = [DB_IPS.get(h) for h in hosts.split(",")]
+    hostaddr = f"hostaddr={','.join(ips)} " if all(ips) else ""
+    return (f"host={hosts} {hostaddr}port={portas} dbname={os.getenv('DB_NAME', 'banco')} "
             f"user={os.getenv('DB_USER', 'app')} password={_segredo('db_app_password', 'DB_PASSWORD')} "
             f"sslmode=verify-full sslrootcert={CA_CERT} connect_timeout=3 "
             f"target_session_attrs=read-write")
 
 
+def dsn_no(no: str) -> str:
+    """Ligação a UM nó concreto (primário ou réplica), para inspeção pelo administrador."""
+    return (f"host={no} hostaddr={DB_IPS[no]} port=5432 dbname={os.getenv('DB_NAME', 'banco')} "
+            f"user={os.getenv('DB_USER', 'app')} password={_segredo('db_app_password', 'DB_PASSWORD')} "
+            f"sslmode=verify-full sslrootcert={CA_CERT} connect_timeout=2 target_session_attrs=any")
+
+
+NOS_BD = {"db-europa": "EU", "db-europa-r": "EU", "db-america": "AM", "db-america-r": "AM",
+          "db-africa": "AF", "db-africa-r": "AF"}
+
 SHARDS = {
     "EU": _dsn("EUROPA", "db-europa", "db-europa-r"),
     "AM": _dsn("AMERICA", "db-america", "db-america-r"),
+    "AF": _dsn("AFRICA", "db-africa", "db-africa-r"),
 }
-SHARD_NOMES = {"EU": "db-europa (Nó A — Europa)", "AM": "db-america (Nó B — América)"}
+SHARD_NOMES = {"EU": "db-europa (Nó A — Europa)", "AM": "db-america (Nó B — América)",
+               "AF": "db-africa (Nó C — África)"}
 
 # --- Segurança -----------------------------------------------------------------
 JWT_PUBLIC_KEY = (PUBLICO / "jwt-public.pem").read_text()

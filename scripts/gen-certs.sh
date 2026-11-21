@@ -20,31 +20,6 @@ DAYS=825
 mkdir -p "$OUT"
 cd "$OUT"
 
-if [[ -f publico/ca.crt && "${FORCE:-0}" != "1" ]]; then
-  echo "[certs] PKI já existe em $(pwd) — nada a fazer (FORCE=1 para regenerar)."
-  exit 0
-fi
-
-SERVICOS="gateway auth api-1 api-2 legacy db-europa db-europa-r db-america db-america-r sentinela"
-mkdir -p ca publico tmp
-for s in $SERVICOS; do mkdir -p "$s"; done
-
-# ------------------------------------------------------------------ CA
-echo "[certs] A gerar Autoridade de Certificação (CA)..."
-openssl genrsa -out ca/ca.key 4096 2>/dev/null
-cat > tmp/ca.cnf <<'CNF'
-[req]
-distinguished_name=dn
-[dn]
-[v3_ca]
-basicConstraints=critical,CA:TRUE
-keyUsage=critical,keyCertSign,cRLSign
-subjectKeyIdentifier=hash
-CNF
-openssl req -x509 -new -key ca/ca.key -sha256 -days "$DAYS" -out publico/ca.crt \
-  -subj "/C=MZ/O=Global Scale Corporation/CN=Global Scale Root CA" \
-  -config tmp/ca.cnf -extensions v3_ca
-
 emitir() {  # emitir <serviço> <SANs>  -> <serviço>/tls.crt + tls.key
   local nome="$1" sans="$2"
   openssl genrsa -out "$nome/tls.key" 2048 2>/dev/null
@@ -64,6 +39,51 @@ EOF
   echo "[certs]   ✓ $nome  ($sans)"
 }
 
+SAN_CONTROLO="DNS:controlo,DNS:localhost,IP:127.0.0.1,IP:172.28.0.46"
+SAN_AFRICA="DNS:db-africa,DNS:localhost,IP:127.0.0.1,IP:172.28.0.47"
+SAN_AFRICA_R="DNS:db-africa-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.48"
+
+# Instalação já existente: só acrescenta os serviços que foram adicionados depois
+# (controlo, fragmento África), sem tocar na CA nem nos segredos já em uso.
+if [[ -f publico/ca.crt && -f ca/ca.key && "${FORCE:-0}" != "1" ]]; then
+  mkdir -p tmp
+  [[ -f controlo/tls.crt ]]    || { mkdir -p controlo;    echo "[certs] + controlo";    emitir controlo    "$SAN_CONTROLO"; }
+  [[ -f db-africa/tls.crt ]]   || { mkdir -p db-africa;   echo "[certs] + db-africa";   emitir db-africa   "$SAN_AFRICA"; }
+  [[ -f db-africa-r/tls.crt ]] || { mkdir -p db-africa-r; echo "[certs] + db-africa-r"; emitir db-africa-r "$SAN_AFRICA_R"; }
+  for s in db-africa db-africa-r; do       # as BD partilham as mesmas palavras-passe
+    for f in postgres_password db_app_password replicador_password; do
+      [[ -f "$s/$f" ]] || cp "db-europa/$f" "$s/$f"
+    done
+  done
+  rm -rf tmp
+  chmod -R a+rX publico controlo db-africa db-africa-r 2>/dev/null || true
+fi
+
+if [[ -f publico/ca.crt && "${FORCE:-0}" != "1" ]]; then
+  echo "[certs] PKI já existe em $(pwd) — nada a fazer (FORCE=1 para regenerar)."
+  exit 0
+fi
+
+SERVICOS="gateway auth api-1 api-2 legacy db-europa db-europa-r db-america db-america-r db-africa db-africa-r sentinela controlo"
+mkdir -p ca publico tmp
+for s in $SERVICOS; do mkdir -p "$s"; done
+
+# ------------------------------------------------------------------ CA
+echo "[certs] A gerar Autoridade de Certificação (CA)..."
+openssl genrsa -out ca/ca.key 4096 2>/dev/null
+cat > tmp/ca.cnf <<'CNF'
+[req]
+distinguished_name=dn
+[dn]
+[v3_ca]
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+CNF
+openssl req -x509 -new -key ca/ca.key -sha256 -days "$DAYS" -out publico/ca.crt \
+  -subj "/C=MZ/O=Global Scale Corporation/CN=Global Scale Root CA" \
+  -config tmp/ca.cnf -extensions v3_ca
+
 echo "[certs] A emitir certificados TLS de servidor..."
 emitir gateway      "DNS:gateway,DNS:localhost,IP:127.0.0.1,IP:172.28.0.10"
 emitir auth         "DNS:auth,DNS:localhost,IP:127.0.0.1,IP:172.28.0.11"
@@ -74,6 +94,9 @@ emitir db-europa    "DNS:db-europa,DNS:localhost,IP:127.0.0.1,IP:172.28.0.41"
 emitir db-america   "DNS:db-america,DNS:localhost,IP:127.0.0.1,IP:172.28.0.42"
 emitir db-europa-r  "DNS:db-europa-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.43"
 emitir db-america-r "DNS:db-america-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.44"
+emitir db-africa    "$SAN_AFRICA"
+emitir db-africa-r  "$SAN_AFRICA_R"
+emitir controlo      "$SAN_CONTROLO"
 
 echo "[certs] A gerar pares de chaves de assinatura..."
 openssl genrsa -out auth/jwt-private.pem 2048 2>/dev/null                  # só o emissor
@@ -86,7 +109,7 @@ echo "[certs] A gerar segredos aleatórios..."
 segredo() { openssl rand -hex 18; }
 PG_ADMIN=$(segredo); PG_APP=$(segredo); PG_REPL=$(segredo); P12=$(segredo)
 DADOS=$(openssl rand -base64 32)          # chave AES-256 de cifragem em repouso
-for s in db-europa db-europa-r db-america db-america-r; do
+for s in db-europa db-europa-r db-america db-america-r db-africa db-africa-r; do
   printf '%s' "$PG_ADMIN" > "$s/postgres_password"
   printf '%s' "$PG_APP"   > "$s/db_app_password"
   printf '%s' "$PG_REPL"  > "$s/replicador_password"
