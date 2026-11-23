@@ -45,7 +45,8 @@ TIMEOUT_LIGACAO = int(os.getenv("SENTINELA_TIMEOUT_S", "1"))
 # fragmento:no_a:no_b[:application_name][:porta_a:porta_b]
 FRAGMENTOS = os.getenv("FRAGMENTOS", "europa:db-europa:db-europa-r,"
                                      "america:db-america:db-america-r,"
-                                     "africa:db-africa:db-africa-r")
+                                     "africa:db-africa:db-africa-r,"
+                                     "central:db-central:db-central-r")
 
 
 def log(msg):
@@ -71,7 +72,8 @@ class Fragmento:
     # IPs fixos da rede global-net (iguais aos do docker-compose.yml); para outros
     # ambientes, IP_<NÓ> no ambiente ou resolução DNS guardada em cache.
     _ips: dict = {"db-europa": "172.28.0.41", "db-america": "172.28.0.42", "db-europa-r": "172.28.0.43",
-                  "db-america-r": "172.28.0.44", "db-africa": "172.28.0.47", "db-africa-r": "172.28.0.48"}
+                  "db-america-r": "172.28.0.44", "db-africa": "172.28.0.47", "db-africa-r": "172.28.0.48",
+                  "db-central": "172.28.0.49", "db-central-r": "172.28.0.50"}
 
     def _ip(self, no):
         ip = os.getenv(f"IP_{no.upper().replace('-', '_')}") or Fragmento._ips.get(no)

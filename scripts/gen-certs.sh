@@ -42,21 +42,25 @@ EOF
 SAN_CONTROLO="DNS:controlo,DNS:localhost,IP:127.0.0.1,IP:172.28.0.46"
 SAN_AFRICA="DNS:db-africa,DNS:localhost,IP:127.0.0.1,IP:172.28.0.47"
 SAN_AFRICA_R="DNS:db-africa-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.48"
+SAN_CENTRAL="DNS:db-central,DNS:localhost,IP:127.0.0.1,IP:172.28.0.49"
+SAN_CENTRAL_R="DNS:db-central-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.50"
 
 # Instalação já existente: só acrescenta os serviços que foram adicionados depois
-# (controlo, fragmento África), sem tocar na CA nem nos segredos já em uso.
+# (controlo, fragmento África, nó central), sem tocar na CA nem nos segredos já em uso.
 if [[ -f publico/ca.crt && -f ca/ca.key && "${FORCE:-0}" != "1" ]]; then
   mkdir -p tmp
   [[ -f controlo/tls.crt ]]    || { mkdir -p controlo;    echo "[certs] + controlo";    emitir controlo    "$SAN_CONTROLO"; }
   [[ -f db-africa/tls.crt ]]   || { mkdir -p db-africa;   echo "[certs] + db-africa";   emitir db-africa   "$SAN_AFRICA"; }
   [[ -f db-africa-r/tls.crt ]] || { mkdir -p db-africa-r; echo "[certs] + db-africa-r"; emitir db-africa-r "$SAN_AFRICA_R"; }
-  for s in db-africa db-africa-r; do       # as BD partilham as mesmas palavras-passe
+  [[ -f db-central/tls.crt ]]   || { mkdir -p db-central;   echo "[certs] + db-central";   emitir db-central   "$SAN_CENTRAL"; }
+  [[ -f db-central-r/tls.crt ]] || { mkdir -p db-central-r; echo "[certs] + db-central-r"; emitir db-central-r "$SAN_CENTRAL_R"; }
+  for s in db-africa db-africa-r db-central db-central-r; do       # as BD partilham as mesmas palavras-passe
     for f in postgres_password db_app_password replicador_password; do
       [[ -f "$s/$f" ]] || cp "db-europa/$f" "$s/$f"
     done
   done
   rm -rf tmp
-  chmod -R a+rX publico controlo db-africa db-africa-r 2>/dev/null || true
+  chmod -R a+rX publico controlo db-africa db-africa-r db-central db-central-r 2>/dev/null || true
 fi
 
 if [[ -f publico/ca.crt && "${FORCE:-0}" != "1" ]]; then
@@ -64,7 +68,7 @@ if [[ -f publico/ca.crt && "${FORCE:-0}" != "1" ]]; then
   exit 0
 fi
 
-SERVICOS="gateway auth api-1 api-2 legacy db-europa db-europa-r db-america db-america-r db-africa db-africa-r sentinela controlo"
+SERVICOS="gateway auth api-1 api-2 legacy db-europa db-europa-r db-america db-america-r db-africa db-africa-r db-central db-central-r sentinela controlo"
 mkdir -p ca publico tmp
 for s in $SERVICOS; do mkdir -p "$s"; done
 
@@ -96,6 +100,8 @@ emitir db-europa-r  "DNS:db-europa-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.43"
 emitir db-america-r "DNS:db-america-r,DNS:localhost,IP:127.0.0.1,IP:172.28.0.44"
 emitir db-africa    "$SAN_AFRICA"
 emitir db-africa-r  "$SAN_AFRICA_R"
+emitir db-central   "$SAN_CENTRAL"
+emitir db-central-r "$SAN_CENTRAL_R"
 emitir controlo      "$SAN_CONTROLO"
 
 echo "[certs] A gerar pares de chaves de assinatura..."
@@ -109,7 +115,7 @@ echo "[certs] A gerar segredos aleatórios..."
 segredo() { openssl rand -hex 18; }
 PG_ADMIN=$(segredo); PG_APP=$(segredo); PG_REPL=$(segredo); P12=$(segredo)
 DADOS=$(openssl rand -base64 32)          # chave AES-256 de cifragem em repouso
-for s in db-europa db-europa-r db-america db-america-r db-africa db-africa-r; do
+for s in db-europa db-europa-r db-america db-america-r db-africa db-africa-r db-central db-central-r; do
   printf '%s' "$PG_ADMIN" > "$s/postgres_password"
   printf '%s' "$PG_APP"   > "$s/db_app_password"
   printf '%s' "$PG_REPL"  > "$s/replicador_password"

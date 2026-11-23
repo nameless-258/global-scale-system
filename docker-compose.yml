@@ -17,6 +17,7 @@ x-api: &api
     db-europa:  { condition: service_healthy }
     db-america: { condition: service_healthy }
     db-africa:  { condition: service_healthy }
+    db-central: { condition: service_healthy }
     namenode:   { condition: service_started }
 
 x-api-env: &api-env
@@ -187,6 +188,52 @@ services:
     networks:
       global-net: { ipv4_address: 172.28.0.48 }
 
+  # Nó CENTRAL — caminho alternativo quando uma região perde os dois nós:
+  # espelho dos saldos de todas as contas + fila de operações pendentes.
+  # Tem a sua própria réplica síncrona e failover, como as regiões.
+  db-central:
+    <<: *postgres
+    hostname: db-central
+    depends_on:
+      certs: { condition: service_completed_successfully }
+    environment:
+      POSTGRES_PASSWORD_FILE: /certs/privado/postgres_password
+      POSTGRES_DB: banco
+      DB_NODE_NAME: db-central
+      DB_ROLE: primario
+      DB_PARCEIRO: db-central-r
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/db-central:/certs/privado:ro
+      - ./db/entrypoint.sh:/db/entrypoint.sh:ro
+      - ./db/00-pg-hba.sh:/docker-entrypoint-initdb.d/00-pg-hba.sh:ro
+      - ./db/init-central.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+      - ./db/20-segredos.sh:/docker-entrypoint-initdb.d/20-segredos.sh:ro
+      - pg-central:/var/lib/postgresql/data
+      - fencing:/fence
+    networks:
+      global-net: { ipv4_address: 172.28.0.49 }
+
+  db-central-r:
+    <<: *postgres
+    hostname: db-central-r
+    depends_on:
+      db-central: { condition: service_healthy }
+    environment:
+      POSTGRES_PASSWORD_FILE: /certs/privado/postgres_password
+      DB_NODE_NAME: db-central-r
+      DB_ROLE: replica
+      DB_PRIMARIO: db-central
+      DB_APP_NAME: db_central_r
+    volumes:
+      - ./certs/publico:/certs/publico:ro
+      - ./certs/db-central-r:/certs/privado:ro
+      - ./db/entrypoint.sh:/db/entrypoint.sh:ro
+      - pg-central-r:/var/lib/postgresql/data
+      - fencing:/fence
+    networks:
+      global-net: { ipv4_address: 172.28.0.50 }
+
   # Sentinela: gere a replicação síncrona e faz o failover automático
   sentinela:
     build: ./services/core
@@ -197,6 +244,7 @@ services:
       db-europa:  { condition: service_healthy }
       db-america: { condition: service_healthy }
       db-africa:  { condition: service_healthy }
+      db-central: { condition: service_healthy }
     volumes:
       - ./certs/publico:/certs/publico:ro
       - ./certs/sentinela:/certs/privado:ro
@@ -351,6 +399,8 @@ volumes:
   pg-america-r:
   pg-africa:
   pg-africa-r:
+  pg-central:
+  pg-central-r:
   coordenador-data:
   legacy-data:
   fencing:

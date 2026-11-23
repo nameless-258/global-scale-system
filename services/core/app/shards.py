@@ -12,6 +12,7 @@ sistema devolve resultados parciais e indica o fragmento indisponível
 (degradação graciosa em vez de falha total).
 """
 import os
+import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -44,6 +45,22 @@ def shard_de(conta_id: str) -> str:
 ESPERA_FAILOVER_S = float(os.getenv("ESPERA_FAILOVER_S", "25"))
 
 
+def _porta_aberta(no: str) -> bool:
+    try:
+        socket.create_connection((config.DB_IPS[no], 5432), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def regiao_em_baixo(shard: str) -> bool:
+    """Verdadeiro se NENHUM dos dois nós do fragmento aceita ligações (0,5 s no máximo).
+    Se um deles responde (por exemplo a réplica durante um failover), o fragmento não
+    está 'em baixo': o caminho normal espera pela promoção."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        return not any(ex.map(_porta_aberta, config.NOS_FRAGMENTO[shard]))
+
+
 def ligar(shard: str, autocommit: bool = False, esperar: float = 0.0) -> psycopg.Connection:
     """Liga ao nó que aceita escritas no fragmento (primário ou réplica promovida).
 
@@ -55,7 +72,7 @@ def ligar(shard: str, autocommit: bool = False, esperar: float = 0.0) -> psycopg
     while True:
         try:
             return psycopg.connect(
-                config.SHARDS[shard], autocommit=autocommit, row_factory=dict_row,
+                config.DSN[shard], autocommit=autocommit, row_factory=dict_row,
                 # lock_timeout: evita esperas infinitas (e deadlocks distribuídos não
                 # detetáveis localmente) — a transação aborta e o 2PC faz rollback.
                 options="-c lock_timeout=5000 -c statement_timeout=15000",
@@ -67,6 +84,8 @@ def ligar(shard: str, autocommit: bool = False, esperar: float = 0.0) -> psycopg
 
 
 def _consultar(shard: str, sql: str, params: tuple) -> list[dict]:
+    if regiao_em_baixo(shard):          # falha em 0,5 s em vez de esperar pelos timeouts
+        raise FragmentoIndisponivel(shard, RuntimeError("os dois nós estão em baixo"))
     with ligar(shard, autocommit=True) as c:
         return c.execute(sql, params).fetchall()
 
@@ -142,6 +161,8 @@ def extracto(conta_id: str, de: str | None = None, ate: str | None = None) -> di
     por isso o extrato é coerente mesmo com transferências a decorrer. O saldo de
     abertura é o saldo atual menos a soma de todos os movimentos."""
     s = shard_de(conta_id)
+    if regiao_em_baixo(s):
+        raise FragmentoIndisponivel(s, RuntimeError("os dois nós estão em baixo"))
     try:
         with ligar(s) as c:
             c.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -203,6 +224,12 @@ def inspecionar_no(no: str, detalhe: bool = True) -> dict:
     """Lê diretamente UM nó (primário ou réplica) e devolve o que lá está guardado,
     tal como está no disco: os dados pessoais aparecem cifrados (AES-256-GCM) e,
     ao lado, decifrados pela API (só ela tem a chave)."""
+    if config.NOS_BD[no] == config.CENTRAL:
+        from .central import inspecionar_central      # o nó central tem outras tabelas
+        return inspecionar_central(no, detalhe)
+    if not _porta_aberta(no):
+        return {"no": no, "regiao": config.NOS_BD[no], "fragmento": config.SHARD_NOMES[config.NOS_BD[no]],
+                "estado": "INDISPONÍVEL", "erro": "Não responde: o servidor está desligado."}
     base = {"no": no, "regiao": config.NOS_BD[no], "fragmento": config.SHARD_NOMES[config.NOS_BD[no]]}
     try:
         with psycopg.connect(config.dsn_no(no), autocommit=True, row_factory=dict_row,
@@ -269,7 +296,7 @@ def cifrar_titulares() -> list[str]:
                     linhas = c.execute("SELECT id, titular FROM contas WHERE titular IS NOT NULL "
                                        "FOR UPDATE").fetchall()
                     for l in linhas:
-                        c.execute("UPDATE contas SET titular_cifrado = %s, titular = NULL WHERE id = %s",
+                        c.execute("UPDATE contas SET titular_cifrado = %s, titular = NULL, versao = versao + 1 WHERE id = %s",
                                   (cifrar(l["titular"], ctx_titular(l["id"])), l["id"]))
             if linhas:
                 acoes.append(f"{s}: {len(linhas)} titulares cifrados (AES-256-GCM)")
@@ -280,6 +307,8 @@ def cifrar_titulares() -> list[str]:
 
 def estado_fragmento(shard: str) -> dict:
     """Que nó é o primário atual do fragmento e em que estado está a réplica."""
+    if regiao_em_baixo(shard):
+        return {"estado": "INDISPONÍVEL", "nos_em_baixo": list(config.NOS_FRAGMENTO[shard])}
     try:
         with ligar(shard, autocommit=True) as c:
             rep = c.execute("SELECT application_name, state, sync_state FROM pg_stat_replication"

@@ -34,6 +34,7 @@ AUDIENCE = os.getenv("JWT_AUDIENCE", "global-scale-api")
 # Nós que podem ser derrubados (o gateway e o próprio controlo ficam de fora,
 # senão a interface deixaria de funcionar).
 SERVICOS = ["db-europa", "db-europa-r", "db-america", "db-america-r", "db-africa", "db-africa-r",
+            "db-central", "db-central-r",
             "api-1", "api-2",
             "auth", "legacy", "namenode", "datanode-1", "datanode-2", "sentinela"]
 ACOES = {"parar": "stop", "ligar": "start", "reiniciar": "restart", "matar": "kill"}

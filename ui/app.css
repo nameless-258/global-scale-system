@@ -473,3 +473,8 @@ button.cartao-conta:hover { box-shadow: 0 6px 20px rgba(22,38,61,.08); transform
 .quadro.contas-regiao td { vertical-align: middle; }
 .quadro.contas-regiao th:nth-child(5), .quadro.contas-regiao th:last-child { text-align: right; }
 .quadro.contas-regiao td.acoes-linha { text-align: right; }
+
+/* ------------------------------------------------------------ Nó Central (caminho alternativo) */
+.bd-regiao.ct { border-top-color: var(--nota); }
+.nota-central { margin: 10px 0; padding: 10px 14px; background: var(--nota-claro); color: #0b5a4a; border-radius: var(--r); font-size: 14px; }
+.cc-central { display: block; margin-top: 6px; font-size: 12.5px; font-weight: 600; color: var(--nota); }

@@ -84,7 +84,7 @@ ANA = ADM = None
 @teste("Saúde: fragmentos, réplicas síncronas, HDFS e legado")
 def t_saude():
     s = http.get("/saude").json()
-    assert len(s["fragmentos"]) == 3, f"esperados 3 fragmentos: {list(s['fragmentos'])}"
+    assert len(s["fragmentos"]) == 4, f"esperados 3 regiões + Nó Central: {list(s['fragmentos'])}"
     for nome, f in s["fragmentos"].items():
         assert f["estado"] == "OK", f"{nome} não está OK"
     assert s["dfs"].get("estado") == "Operational", f"DFS: {s['dfs']}"
@@ -336,6 +336,51 @@ def t_auditoria():
     return f"({v['entradas']} entradas)"
 
 
+def _america():
+    s = http.get("/saude").json()
+    return next(f for n, f in s["fragmentos"].items() if "América" in n)
+
+
+@teste("Nó Central: com os DOIS nós da América em baixo, as transferências continuam e são reconciliadas")
+def t_central():
+    am = _america()
+    assert am["estado"] == "OK", "a América tem de estar ligada no início do teste"
+    prim = am["primario_atual"]
+    rep = "db-america-r" if prim == "db-america" else "db-america"
+    diego = token("diego", "Diego@2026")
+    antes = total(ADM)
+    ctl = lambda svc, acao: http.post(f"/controlo/nos/{svc}/{acao}", headers=ADM)
+    try:
+        assert ctl(rep, "parar").status_code == 200, "não foi possível parar a réplica (serviço controlo)"
+        assert ctl(prim, "parar").status_code == 200
+        time.sleep(2)
+        r1 = http.post("/transferencias", json=tx("EU-1003", "AM-2002", "40"), headers=ANA).json()
+        assert r1.get("via_central") and r1["estado"] == "CONFIRMADA", f"Europa -> América: {r1}"
+        r2 = http.post("/transferencias", json=tx("AM-2002", "EU-1003", "15"), headers=diego).json()
+        assert r2.get("via_central") and r2["estado"] == "CONFIRMADA", f"América -> Europa: {r2}"
+        r3 = http.post("/transferencias", json=tx("AM-2002", "EU-1003", "99999999"), headers=diego)
+        assert r3.status_code == 409, "a central tem de recusar saldo insuficiente"
+        assert total(ADM) == antes, "o total mudou com a América em baixo"
+    finally:
+        ctl(prim, "ligar")
+        ctl(rep, "ligar")
+    fim = time.time() + 150
+    while time.time() < fim:
+        am = _america()
+        pend = http.get("/admin/bd/db-central", headers=ADM).json().get("n_pendentes")
+        if am["estado"] == "OK" and pend == 0 and any(r.get("modo") == "sync" for r in (
+                am["replicas"] if isinstance(am["replicas"], list) else [])):
+            break
+        time.sleep(3)
+    else:
+        raise AssertionError("a América não voltou ou as operações pendentes não foram aplicadas")
+    ext = http.get("/contas/AM-2002/extracto", headers=diego).json()
+    centrais = [m for m in ext["movimentos"] if m["referencia"] in (r1["tx_id"], r2["tx_id"])]
+    assert len(centrais) == 2 and all(m["protocolo"] == "CENTRAL" for m in centrais), centrais
+    assert total(ADM) == antes, "o total mudou depois da reconciliação"
+    return "(2 transferências pela central, aplicadas na América quando voltou; total igual)"
+
+
 @teste("Concorrência: 30 transferências 2PC em paralelo nos dois sentidos")
 def t_concorrencia():
     # cada titular movimenta a SUA conta: Ana (EU-1003, MZN) e Diego (AM-2002, MZN),
@@ -365,7 +410,7 @@ if __name__ == "__main__":
     for t in [t_saude, t_login, t_password, t_sem_token, t_token_forjado, t_cifragem, t_local,
               t_2pc, t_africa, t_conservacao, t_saldo, t_fase1, t_autorizacao, t_admin_nao_debita, t_adulterada, t_replay,
               t_expirada, t_taxas, t_taxa_update, t_saga_ok, t_saga_comp, t_carteira, t_carteira_invalida,
-              t_extracto, t_admin_cliente, t_hdfs, t_auditoria,
+              t_extracto, t_admin_cliente, t_hdfs, t_auditoria, t_central,
               t_concorrencia, t_replicas]:
         t()
     ok = sum(1 for _, p, _ in resultados if p)

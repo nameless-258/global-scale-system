@@ -27,7 +27,7 @@ if _marca.exists():
     while _marca.exists():
         _t.sleep(5)
 
-from . import legado  # noqa: E402
+from . import central, legado  # noqa: E402
 from .dfs import AuditoriaEncadeada, DFSErro, criar_dfs, verificar_cadeia
 from .security import (Utilizador, exigir_admin, sha256_hex, utilizador_atual,
                        verificar_frescura, verificar_integridade)
@@ -55,6 +55,8 @@ async def ciclo_de_vida(app: FastAPI):
         print(f"[recuperação/arranque] erro: {e}", flush=True)
     t = threading.Thread(target=coordenador.ciclo_recuperacao, args=(_parar,), daemon=True)
     t.start()
+    # Nó Central: espelho dos saldos e reconciliação das regiões que voltam
+    threading.Thread(target=central.ciclo, args=(_parar,), daemon=True).start()
     yield
     _parar.set()
 
@@ -62,8 +64,9 @@ async def ciclo_de_vida(app: FastAPI):
 app = FastAPI(
     title="Global-Scale System — API Financeira Distribuída",
     version="1.0.0",
-    description="Núcleo REST/JSON: contas fragmentadas (Europa/América), transferências com "
-                "Two-Phase Commit, ordens interbancárias com Saga, JWT RS256, SHA-256 e HDFS.",
+    description="Núcleo REST/JSON: contas fragmentadas (Europa, América, África), transferências com "
+                "Two-Phase Commit, Nó Central como caminho alternativo quando uma região inteira cai, "
+                "ordens interbancárias e carteiras móveis com Saga, JWT RS256, SHA-256 e HDFS.",
     lifespan=ciclo_de_vida,
 )
 
@@ -180,10 +183,26 @@ def listar_contas(u: Utilizador = Depends(utilizador_atual)):
                                         "versao FROM contas WHERE owner_username = %s ORDER BY id",
                                         (u.username,))
     com_titular(linhas)
+    linhas, falhas, pela_central = _completar_com_central(
+        linhas, falhas, owner=None if u.is_admin else u.username)
     return {"utilizador": u.username, "contas": [{k: para_json(v) for k, v in l.items()}
-                                                  for l in linhas],
-            "fragmentos_indisponiveis": falhas,
+                                                  for l in sorted(linhas, key=lambda l: l["id"])],
+            "fragmentos_indisponiveis": falhas, "servidos_pela_central": pela_central,
             "resultado_parcial": bool(falhas)}
+
+
+def _completar_com_central(linhas, falhas, owner=None, excluir_owner=None):
+    """Regiões com os dois nós em baixo: as suas contas vêm do espelho do Nó Central."""
+    nome_para_shard = {v: k for k, v in config.SHARD_NOMES.items()}
+    em_baixo = [nome_para_shard[f] for f in falhas if f in nome_para_shard]
+    if not em_baixo or central.regiao_em_baixo(config.CENTRAL):
+        return linhas, falhas, []
+    try:
+        extra = central.contas_espelho(em_baixo, owner=owner, excluir_owner=excluir_owner)
+    except Exception:
+        return linhas, falhas, []
+    servidas = [config.SHARD_NOMES[s] for s in em_baixo]
+    return linhas + extra, [f for f in falhas if f not in servidas], servidas
 
 
 @app.get("/beneficiarios", tags=["contas"])
@@ -193,9 +212,10 @@ def beneficiarios(u: Utilizador = Depends(utilizador_atual)):
     linhas, falhas = scatter_gather("SELECT id, titular, titular_cifrado, regiao, moeda FROM contas "
                                     "WHERE owner_username <> %s ORDER BY id", (u.username,))
     com_titular(linhas)
+    linhas, falhas, pela_central = _completar_com_central(linhas, falhas, excluir_owner=u.username)
     return {"beneficiarios": [{"conta": l["id"], "titular": l["titular"], "moeda": l["moeda"],
-                               "regiao": l["regiao"]} for l in linhas],
-            "fragmentos_indisponiveis": falhas}
+                               "regiao": l["regiao"]} for l in sorted(linhas, key=lambda l: l["id"])],
+            "fragmentos_indisponiveis": falhas, "servidos_pela_central": pela_central}
 
 
 @app.get("/contas/{conta_id}", tags=["contas"])
@@ -278,7 +298,10 @@ def extracto_conta(conta_id: str, de: str | None = Query(None, pattern=r"^\d{4}-
                    ate: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
                    u: Utilizador = Depends(utilizador_atual)):
     """Extrato bancário: débitos, créditos e saldo após cada movimento, num período opcional."""
-    e = extracto(conta_id.upper(), de, ate)
+    try:
+        e = extracto(conta_id.upper(), de, ate)
+    except FragmentoIndisponivel:
+        e = central.extracto_central(conta_id.upper())    # região em baixo: o que a central sabe
     if not u.is_admin and e["owner_username"] != u.username:
         raise HTTPException(403, "Não é titular desta conta")
     return e

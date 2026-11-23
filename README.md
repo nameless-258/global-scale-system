@@ -18,6 +18,7 @@ Projeto prático do Exame Laboratorial da disciplina **Sistemas Distribuídos e 
 | `db-america` | PostgreSQL 16 | 172.28.0.42 :5432 | Fragmento B, com as contas `AM-*` |
 | `db-africa` | PostgreSQL 16 | 172.28.0.47 :5432 | Fragmento C, com as contas `AF-*` |
 | `db-europa-r`, `db-america-r`, `db-africa-r` | PostgreSQL 16 | 172.28.0.43/44/48 :5432 | **Réplicas síncronas** (streaming sobre TLS) de cada fragmento |
+| `db-central`, `db-central-r` | PostgreSQL 16 | 172.28.0.49/50 :5432 | **Nó Central**: espelho dos saldos de todas as contas e operações pendentes; caminho alternativo quando uma região perde os dois nós |
 | `sentinela` | Python | 172.28.0.45 | Vigia os primários, gere o modo síncrono, faz **failover automático** com *fencing* e reintegra o antigo primário como réplica |
 | `controlo` | Python / FastAPI | 172.28.0.46 | Só para o administrador: parar, ligar e matar nós a partir da interface, e ler os seus registos |
 | `namenode` | Hadoop HDFS 3.3.6 | 172.28.0.51 · host **:9870** | Metadados do DFS |
@@ -64,7 +65,7 @@ Abra **https://localhost:8443/ui/** (para o browser confiar no certificado, impo
 
 - **Clientes e contas:** lista com **filtro por região** (Europa, América, África), criação de clientes e abertura de contas em qualquer região e moeda.
 - **Depositar:** credita dinheiro numa conta de cliente.
-- **Bases de dados:** lê cada um dos seis nós diretamente. Mostra o papel (primário ou réplica), o número de contas e movimentos, a posição do WAL e se a réplica está igual ao primário; ao clicar num nó vê as tabelas tal como estão guardadas, com o nome do titular **cifrado** e, ao lado, decifrado pela API.
+- **Bases de dados:** lê cada um dos oito nós diretamente (incluindo o Nó Central, com o espelho e as operações pendentes). Mostra o papel (primário ou réplica), o número de contas e movimentos, a posição do WAL e se a réplica está igual ao primário; ao clicar num nó vê as tabelas tal como estão guardadas, com o nome do titular **cifrado** e, ao lado, decifrado pela API.
 - **Cenários de falha:** botões que executam os cenários da tabela mais abaixo e explicam o resultado.
 - **Coordenador 2PC**, **Ficheiros no HDFS** e **Câmbio**.
 
@@ -88,6 +89,7 @@ Carteiras móveis de demonstração no mainframe: 841234567 (Joana Mabunda) e 85
 
 - **Réplica síncrona por fragmento:** cada `COMMIT` (e cada `PREPARE TRANSACTION` do 2PC) só é confirmado depois de gravado também na réplica, por isso um failover não perde transações confirmadas (RPO = 0).
 - **Failover automático:** a `sentinela` verifica os primários a cada 1 s. À 3.ª falha seguida veda o antigo primário (marca no volume `fencing`) e promove a réplica, em cerca de 5 s. A API liga-se por IP fixo com `target_session_attrs=read-write` aos dois nós e espera até 25 s por um failover em curso, por isso uma transferência feita durante a queda é concluída no novo primário (por exemplo, com o `db-america` em baixo as transferências continuam pelo `db-america-r`).
+- **Nó Central (região inteira em baixo):** se os **dois** nós de uma região caírem, as transferências para e a partir dessa região continuam. O `db-central` guarda uma cópia exata dos saldos de todas as contas (publicada depois de cada transação e verificada a cada 2 s por número de versão). Com a região em baixo, a central confirma o titular e o saldo, atualiza o espelho e guarda a operação como pendente; uma transferência com a outra região é um 2PC entre a central e essa região. Quando a região volta, as operações pendentes são aplicadas nela pela ordem em que foram feitas (idempotente, `UNIQUE (tx_id, conta_id, tipo)`), e só depois a região volta a aceitar operações diretas. Se a região **e** a central estiverem em baixo, a transferência é abortada sem movimentar dinheiro. Ver `services/core/app/central.py`.
 - **Reintegração:** quando o antigo primário volta, não arranca como primário (sem *split-brain*): copia o estado do novo primário com `pg_basebackup` e passa a ser a sua réplica síncrona. Os papéis são dinâmicos.
 - **Recuperação por outra réplica:** o WAL dos coordenadores está num volume partilhado. Se a `api-1` morrer de vez a meio do 2PC, a `api-2` lê a decisão e conclui as transações preparadas.
 - **Cifragem em repouso:** os nomes dos titulares e das contrapartes são cifrados na aplicação com **AES-256-GCM** (com o contexto da linha como dados associados). A base de dados e as réplicas só guardam bytes cifrados.
@@ -135,7 +137,7 @@ O guião completo, passo a passo, está em `bash scripts/demo.sh`. Os cenários 
 
 | Cenário | Comando | Resultado esperado |
 |---|---|---|
-| Nó da BD em baixo | `docker compose stop db-america`, depois `gss transferir EU-1001 AM-2001 20` | HTTP 503, transação **ABORTADA** sem movimentar dinheiro. Transferências só na Europa continuam a funcionar |
+| Primário da BD em baixo | `docker compose stop db-america`, depois `gss transferir EU-1001 AM-2001 20` | A sentinela promove `db-america-r` em ~5 s e a transferência é confirmada nele |
 | Falha de rede na fase 1 | `gss transferir EU-1001 AM-2001 50 --falha participante_indisponivel_fase1` | ABORT global e ROLLBACK do participante já preparado |
 | Nó cai na fase 2 | `gss transferir EU-1002 AM-2002 100 --falha atraso_fase2` e, durante a espera, `docker compose kill db-america` | `CONFIRMADA_PENDENTE`. Depois de `docker compose start db-america`, a recuperação faz `COMMIT PREPARED` |
 | Crash do coordenador | `gss transferir AM-2001 EU-1003 300 --falha crash_coordenador_fase2` | O contentor morre e o Docker reinicia-o. A recuperação lê o WAL e conclui o commit |
@@ -146,6 +148,8 @@ O guião completo, passo a passo, está em `bash scripts/demo.sh`. Os cenários 
 | Primário morre na fase 2 | `gss transferir EU-1002 AM-2002 100 --falha atraso_fase2` e, durante a espera, `docker compose stop db-america` | A sentinela promove `db-america-r` e a recuperação faz `COMMIT PREPARED` no novo primário |
 | Antigo primário volta | `docker compose start db-america` | Fica **vedado** (não arranca como primário), copia o novo primário e volta como **réplica síncrona**: sem *split-brain* |
 | Transferir durante a queda | Na interface: "A América perde o servidor principal" | A transferência espera pelo failover e é confirmada no `db-america-r` |
+| **Os dois nós da América em baixo** | Na interface: "A América fica sem os dois servidores" | As transferências nos dois sentidos seguem pelo **Nó Central**; quando a América volta, recebe as operações por ordem e o total mantém-se |
+| América **e** Nó Central em baixo | Na interface: "A América e o Nó Central em baixo" | Sem caminho alternativo: transferência abortada (HTTP 503), a Europa continua, consulta com resultado parcial |
 | Coordenador morre de vez | `gss transferir ... --falha crash_permanente_coordenador` (enviado à `api-1`) | A `api-2` assume e conclui a transação a partir do WAL da `api-1` |
 
 Depois dos cenários de failover, reponha a topologia inicial com `bash scripts/reset-alta-disponibilidade.sh` (no PowerShell: `.\scripts\reset-alta-disponibilidade.ps1`). Todos estes cenários também existem como botões na interface, em **Cenários de falha**.
@@ -156,7 +160,14 @@ Depois dos cenários de failover, reponha a topologia inicial com `bash scripts/
 docker compose run --rm -T --entrypoint python cliente /scripts/testes.py
 ```
 
-São 29 testes: autenticação, cifragem, 2PC local e distribuído, as três regiões, conservação do valor, saldo insuficiente, falha na fase 1, autorização (incluindo o administrador impedido de debitar contas de clientes), integridade, replay, mensagens expiradas, taxas replicadas, Saga (sucesso e compensação), carteiras móveis (envio e número inválido), extrato, criação de clientes, contas e depósitos, HDFS, auditoria, concorrência sem deadlocks e estado das réplicas.
+São 30 testes: autenticação, cifragem, 2PC local e distribuído, as três regiões, conservação do valor, saldo insuficiente, falha na fase 1, autorização (incluindo o administrador impedido de debitar contas de clientes), integridade, replay, mensagens expiradas, taxas replicadas, Saga (sucesso e compensação), carteiras móveis (envio e número inválido), extrato, criação de clientes, contas e depósitos, HDFS, auditoria, **Nó Central** (os dois nós da América desligados a sério, transferências nos dois sentidos e reconciliação), concorrência sem deadlocks e estado das réplicas.
+
+Prova de conectividade entre os nós (DNS interno e ligação TCP a cada serviço):
+
+```bash
+docker compose exec -T api-1 python - < scripts/conectividade.py                 # bash
+Get-Content scripts/conectividade.py | docker compose exec -T api-1 python -     # PowerShell
+```
 
 Para consultar os saldos e as transações preparadas diretamente nos nós:
 
@@ -172,7 +183,7 @@ docker compose exec db-america psql -U postgres -d banco -c "select gid, prepare
 ├── nginx/nginx.conf            Gateway HTTPS, balanceamento e interface /ui/
 ├── ui/                         Interface gráfica (HTML, CSS e JavaScript, sem dependências externas)
 ├── config/hadoop.env           Configuração do HDFS
-├── db/                         Esquema, fragmentos, TLS e pg_hba do PostgreSQL
+├── db/                         Esquema das regiões e do Nó Central, TLS e pg_hba do PostgreSQL
 ├── services/
 │   ├── auth/                   Serviço de autenticação (JWT RS256) e gestão de utilizadores
 │   ├── core/app/
@@ -183,14 +194,16 @@ docker compose exec db-america psql -U postgres -d banco -c "select gid, prepare
 │   │   ├── cripto.py           Cifragem em repouso AES-256-GCM
 │   │   ├── sentinela.py        Vigilância, failover, fencing e reintegração das réplicas
 │   │   ├── controlo.py         Controlo dos nós pela interface (só admin)
+│   │   ├── central.py          Nó Central: espelho, operações em substituição e reconciliação
 │   │   ├── dfs.py              Cliente WebHDFS e auditoria encadeada
 │   │   └── legado.py           Adaptador JSON <-> XML para o mainframe
 │   └── legacy-java/            Mainframe do banco parceiro (Java 21)
 ├── scripts/
 │   ├── gen-certs.sh            PKI e segredos por serviço
 │   ├── cliente.py              Cliente de linha de comandos
-│   ├── testes.py               29 testes automáticos
+│   ├── testes.py               30 testes automáticos
 │   ├── verificar_bd.py         Lê cada nó da base de dados pela API
+│   ├── conectividade.py        Prova de conectividade entre os nós (DNS + TCP)
 │   ├── reset-alta-disponibilidade.sh  Repõe primários e réplicas (.ps1 para PowerShell)
 │   └── demo.sh                 Guião da demonstração (17 passos)
 └── docs/arquitetura.(png|svg|dot)

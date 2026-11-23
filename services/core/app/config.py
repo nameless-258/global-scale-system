@@ -38,6 +38,7 @@ def _segredo(nome: str, env: str | None = None) -> str:
 # no DNS do Docker e cada resolução demoraria segundos; pelo IP, a falha é imediata.
 DB_IPS = {"db-europa": "172.28.0.41", "db-america": "172.28.0.42", "db-europa-r": "172.28.0.43",
           "db-america-r": "172.28.0.44", "db-africa": "172.28.0.47", "db-africa-r": "172.28.0.48",
+          "db-central": "172.28.0.49", "db-central-r": "172.28.0.50",
           **dict(e.split("=", 1) for e in os.getenv("DB_IPS", "").split(",") if "=" in e)}
 
 
@@ -60,15 +61,23 @@ def dsn_no(no: str) -> str:
 
 
 NOS_BD = {"db-europa": "EU", "db-europa-r": "EU", "db-america": "AM", "db-america-r": "AM",
-          "db-africa": "AF", "db-africa-r": "AF"}
+          "db-africa": "AF", "db-africa-r": "AF", "db-central": "CT", "db-central-r": "CT"}
+# Os dois nós de cada fragmento (para saber, em 0,5 s, se uma região inteira está em baixo)
+NOS_FRAGMENTO = {"EU": ("db-europa", "db-europa-r"), "AM": ("db-america", "db-america-r"),
+                 "AF": ("db-africa", "db-africa-r"), "CT": ("db-central", "db-central-r")}
 
 SHARDS = {
     "EU": _dsn("EUROPA", "db-europa", "db-europa-r"),
     "AM": _dsn("AMERICA", "db-america", "db-america-r"),
     "AF": _dsn("AFRICA", "db-africa", "db-africa-r"),
 }
+# Nó CENTRAL: não é dono de contas; é o caminho alternativo quando uma região
+# inteira (primário e réplica) está em baixo. Ver central.py.
+CENTRAL = "CT"
+DSN = {**SHARDS, CENTRAL: _dsn("CENTRAL", "db-central", "db-central-r")}
 SHARD_NOMES = {"EU": "db-europa (Nó A — Europa)", "AM": "db-america (Nó B — América)",
-               "AF": "db-africa (Nó C — África)"}
+               "AF": "db-africa (Nó C — África)", CENTRAL: "db-central (Nó Central)"}
+CENTRAL_SYNC_S = float(os.getenv("CENTRAL_SYNC_S", "2"))
 
 # --- Segurança -----------------------------------------------------------------
 JWT_PUBLIC_KEY = (PUBLICO / "jwt-public.pem").read_text()

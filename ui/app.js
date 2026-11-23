@@ -275,6 +275,8 @@ const NOS = {
   "db-america-r": { x: 865, y: 170, nome: "db-america-r", papel: "" },
   "db-africa": { x: 625, y: 290, nome: "db-africa", papel: "" },
   "db-africa-r": { x: 865, y: 290, nome: "db-africa-r", papel: "" },
+  "db-central": { x: 625, y: 362, nome: "db-central", papel: "" },
+  "db-central-r": { x: 865, y: 362, nome: "db-central-r", papel: "" },
   namenode: { x: 625, y: 430, nome: "namenode", papel: "HDFS, metadados" },
   "datanode-1": { x: 775, y: 430, nome: "datanode-1", papel: "blocos" },
   "datanode-2": { x: 915, y: 430, nome: "datanode-2", papel: "blocos" },
@@ -286,7 +288,9 @@ const LIGACOES = [
   ["api-1", "db-africa", "dados"], ["api-2", "db-africa", "dados"],
   ["api-1", "db-europa-r", "dados-r"], ["api-2", "db-europa-r", "dados-r"], ["api-1", "db-america-r", "dados-r"], ["api-2", "db-america-r", "dados-r"],
   ["api-1", "db-africa-r", "dados-r"], ["api-2", "db-africa-r", "dados-r"],
+  ["api-1", "db-central", "dados"], ["api-2", "db-central", "dados"], ["api-1", "db-central-r", "dados-r"], ["api-2", "db-central-r", "dados-r"],
   ["db-europa", "db-europa-r", "replica"], ["db-america", "db-america-r", "replica"], ["db-africa", "db-africa-r", "replica"],
+  ["db-central", "db-central-r", "replica"], ["sentinela", "db-central", "vigia"], ["sentinela", "db-central-r", "vigia"],
   ["sentinela", "db-europa", "vigia"], ["sentinela", "db-america", "vigia"], ["sentinela", "db-africa", "vigia"],
   ["sentinela", "db-europa-r", "vigia"], ["sentinela", "db-america-r", "vigia"], ["sentinela", "db-africa-r", "vigia"],
   ["api-1", "legacy"], ["api-2", "legacy"], ["api-2", "namenode"],
@@ -324,8 +328,9 @@ function definirNo(id, cls, papel, primario = false) {
   g.querySelector("text.papel").textContent = papel;
 }
 let saudeAtual = null, contentores = null;
-const REGIOES = [["Europa", "db-europa", "db-europa-r"], ["América", "db-america", "db-america-r"], ["África", "db-africa", "db-africa-r"]];
-const regiaoDoNo = (id) => (id.includes("europa") ? "Europa" : id.includes("africa") ? "África" : "América");
+const REGIOES = [["Europa", "db-europa", "db-europa-r"], ["América", "db-america", "db-america-r"], ["África", "db-africa", "db-africa-r"],
+  ["Central", "db-central", "db-central-r"]];
+const regiaoDoNo = (id) => (id.includes("europa") ? "Europa" : id.includes("africa") ? "África" : id.includes("central") ? "Central" : "América");
 const regiaoDaConta = (c) => (c.startsWith("EU") ? "Europa" : c.startsWith("AF") ? "África" : "América");
 function porRegiao(obj, regiao) { if (!obj) return null; const k = Object.keys(obj).find((x) => x.includes(regiao)); return k ? obj[k] : null; }
 function primarioDe(regiao) { const f = saudeAtual && porRegiao(saudeAtual.fragmentos, regiao); return f && f.estado === "OK" ? f.primario_atual : null; }
@@ -380,7 +385,9 @@ function atualizarMapa() {
     ln.classList.toggle("oculta", inativa && tipo === "dados-r");
   }
   $("mapa-legenda").textContent = !s ? "A API não está a responder."
-    : REGIOES.map(([reg]) => { const f = porRegiao(s.fragmentos, reg); return `${reg}: ${f && f.estado === "OK" ? f.primario_atual : "indisponível"}.`; }).join(" ")
+    : REGIOES.map(([reg]) => { const f = porRegiao(s.fragmentos, reg); const ok = f && f.estado === "OK";
+        const central = porRegiao(s.fragmentos, "Central");
+        return `${reg === "Central" ? "Nó Central" : reg}: ${ok ? f.primario_atual : reg !== "Central" && central && central.estado === "OK" ? "em baixo, servida pelo Nó Central" : "indisponível"}.`; }).join(" ")
       + ` HDFS com ${dfs && dfs.datanodes_vivos != null ? dfs.datanodes_vivos : "?"} DataNodes vivos.`;
 }
 
@@ -409,7 +416,8 @@ async function animarTransferencia(r, origem, destino) {
   const d = r.dados || {};
   const coord = ["api-1", "api-2"].includes(d.coordenador) ? d.coordenador : (["api-1", "api-2"].includes(r.no) ? r.no : null);
   if (!coord) return;
-  const pO = primarioDe(regiaoDaConta(origem)), pD = primarioDe(regiaoDaConta(destino));
+  const pC = d.via_central ? primarioDe("Central") : null;
+  const pO = primarioDe(regiaoDaConta(origem)) || pC, pD = primarioDe(regiaoDaConta(destino)) || pC;
   await animarCaminho(["navegador", "gateway", coord], "");
   const parts = [...new Set([pO, pD].filter(Boolean))];
   const abort = !r.ok || d.estado === "ABORTADA";
@@ -481,11 +489,12 @@ function mostrarLivro(d) {
     return;
   }
   if (totalInicial === null) totalInicial = d.total_equivalente_MZN;
+  const pelaCentral = (d.servidos_pela_central || []).length ? ` ${d.servidos_pela_central.map((x) => x.split(" (")[0]).join(", ")} em baixo: contado pelo Nó Central.` : "";
   const dif = Number(d.total_equivalente_MZN) - Number(totalInicial) - depositosSessao;
   cons.className = "livro-conservacao" + (Math.abs(dif) >= 0.005 ? " mudou" : "");
   const deps = depositosSessao > 0.005 ? ` Entraram ${fmt(depositosSessao)} MZN em depósitos.` : "";
-  cons.textContent = Math.abs(dif) < 0.005 ? `Sem dinheiro criado nem perdido desde que entrou.${deps}`
-    : `${dif > 0 ? "+" : ""}${fmt(dif)} MZN desde que entrou (envios para fora do banco ou arredondamentos de câmbio).${deps}`;
+  cons.textContent = (Math.abs(dif) < 0.005 ? `Sem dinheiro criado nem perdido desde que entrou.${deps}`
+    : `${dif > 0 ? "+" : ""}${fmt(dif)} MZN desde que entrou (envios para fora do banco ou arredondamentos de câmbio).${deps}`) + pelaCentral;
 }
 function mostrarLivroCliente() {
   if (!dadosCliente) return;
@@ -543,8 +552,8 @@ async function ciclo() {
 const NOME_MOEDA = { EUR: "euros", USD: "dólares", MZN: "meticais", ZAR: "randes" };
 const SIMBOLO = { EUR: "€", USD: "US$", MZN: "MT", ZAR: "R" };
 const fmtMoeda = (v, m) => `${fmt(v)} ${SIMBOLO[m] || m}`;
-const nomeRegiao = (r) => (r === "AM" ? "América" : r === "AF" ? "África" : "Europa");
-const classeRegiao = (r) => (r === "AM" ? " am" : r === "AF" ? " af" : "");
+const nomeRegiao = (r) => (r === "AM" ? "América" : r === "AF" ? "África" : r === "CT" ? "Nó Central" : "Europa");
+const classeRegiao = (r) => (r === "AM" ? " am" : r === "AF" ? " af" : r === "CT" ? " ct" : "");
 const OPERADORA = { "M-PESA": "M-Pesa", "E-MOLA": "e-Mola", MKESH: "mKesh" };
 const PREFIXOS = { "M-PESA": ["84", "85"], "E-MOLA": ["86", "87"], MKESH: ["82", "83"] };
 const BANCOS = { BCI: "BCI", "MILLENNIUM-BIM": "Millennium bim", "STANDARD-BANK": "Standard Bank", ABSA: "Absa", MOZA: "Moza Banco", "BANCO-PARCEIRO-MZ": "Banco Parceiro" };
@@ -579,7 +588,8 @@ function mostrarContasCliente() {
       el("span", { class: "cc-topo" }, el("span", { class: "cc-tipo" }, `Conta em ${NOME_MOEDA[c.moeda] || c.moeda}`),
         el("span", { class: "regiao" + classeRegiao(c.regiao) }, nomeRegiao(c.regiao))),
       el("span", { class: "cc-saldo" }, fmtMoeda(c.saldo, c.moeda)),
-      el("span", { class: "cc-num" }, `N.º ${c.id}`)));
+      el("span", { class: "cc-num" }, `N.º ${c.id}`),
+      c.via_central ? el("span", { class: "cc-central" }, "Região em baixo: saldo do Nó Central") : null));
   }
   if (!dadosCliente.contas.length) caixa.append(el("div", { class: "vazio-msg" }, "Ainda não tem contas. Peça ao banco para abrir uma."));
   if (dadosCliente.parcial) caixa.append(el("div", { class: "vazio-msg" },
@@ -810,6 +820,8 @@ function comprovativo(r, p) {
       ? `${(d.motivo || "").replace(/^Rejeitada pelo banco parceiro: /, "Recusada pelo destino: ")} O valor voltou à sua conta.`
       : MOTIVOS[d.erro] || d.detalhe || "O servidor recusou a transferência.") : null,
     d.estado === "CONFIRMADA_PENDENTE" ? el("p", { class: "motivo" }, "A decisão de confirmar já foi tomada e gravada. Quando o servidor que falhou voltar, a recuperação automática termina a operação.") : null,
+    d.via_central ? el("p", { class: "nota-central" }, `Os servidores da ${(d.regioes_em_baixo || []).map(nomeRegiao).join(" e ")} estão em baixo. `
+      + "A operação foi autorizada pelo Nó Central e fica registada; o banco aplica-a nessa região assim que ela voltar.") : null,
     el("details", { class: "json" }, el("summary", {}, "Detalhes técnicos (protocolo, fases e mensagens)"), recibo(r, "Resposta do servidor")));
 }
 
@@ -838,6 +850,7 @@ async function carregarExtrato() {
       el("div", {}, el("strong", {}, e.titular), el("span", {}, `Conta em ${NOME_MOEDA[m]} N.º ${e.conta}, ${nomeRegiao(e.regiao)}`)),
       el("div", { class: "ex-periodo" }, e.periodo.de || e.periodo.ate ? `De ${desc(e.periodo.de) || "a abertura"} a ${desc(e.periodo.ate) || "hoje"}` : "Desde a abertura da conta",
         el("span", {}, `Emitido a ${new Date().toLocaleString("pt-PT")}`))),
+    ...(e.nota ? [el("p", { class: "nota-central" }, e.nota)] : []),
     el("div", { class: "ex-resumo" },
       [["Saldo inicial", e.saldo_inicial], ["Créditos", e.total_creditos, "entra"], ["Débitos", e.total_debitos, "sai"], ["Saldo final", e.saldo_final, "forte"]]
         .map(([k, v, c]) => el("div", { class: c || "" }, el("small", {}, k), el("strong", {}, `${c === "entra" ? "+" : c === "sai" ? "−" : ""}${fmtMoeda(v, m)}`)))),
@@ -1012,20 +1025,21 @@ async function carregarBD() {
   const caixa = limpar($("bd-resumo"));
   if (!r.ok) return caixa.append(recibo(r, "Não foi possível ler as bases de dados"));
   const nos = r.dados.nos;
-  const grupos = [["EU", "Europa"], ["AM", "América"], ["AF", "África"]];
+  const grupos = [["EU", "Europa"], ["AM", "América"], ["AF", "África"], ["CT", "Nó Central"]];
   caixa.append(el("div", { class: "bd-grelha" }, grupos.map(([reg, nome]) => {
     const par = nos.filter((n) => n.regiao === reg);
     const prim = par.find((n) => n.papel === "primário");
     return el("section", { class: "bd-regiao" + classeRegiao(reg) },
-      el("h3", {}, `${nome}`, el("small", {}, ` contas ${reg}-*`)),
+      el("h3", {}, `${nome}`, el("small", {}, reg === "CT" ? " espelho + pendentes" : ` contas ${reg}-*`)),
       par.map((n) => {
         const emDia = prim && n.papel === "réplica" && n.lsn === prim.lsn;
         return el("button", { type: "button", class: "bd-no" + (n.estado !== "OK" ? " em-baixo" : "") + (noBD === n.no ? " escolhido" : ""),
           onclick: () => { noBD = n.no; carregarBD(); verNoBD(n.no); } },
           el("span", { class: "bd-nome" }, n.no, el("span", { class: "bd-papel" + (n.papel === "primário" ? " prim" : "") }, n.estado === "OK" ? n.papel : "em baixo")),
           n.estado === "OK" ? [
-            el("span", { class: "bd-linha" }, el("span", {}, "Contas"), el("b", {}, String(n.n_contas))),
-            el("span", { class: "bd-linha" }, el("span", {}, "Movimentos"), el("b", {}, String(n.n_movimentos))),
+            el("span", { class: "bd-linha" }, el("span", {}, reg === "CT" ? "Contas no espelho" : "Contas"), el("b", {}, String(n.n_contas))),
+            reg === "CT" ? el("span", { class: "bd-linha" }, el("span", {}, "Operações por aplicar"), el("b", {}, String(n.n_pendentes)))
+              : el("span", { class: "bd-linha" }, el("span", {}, "Movimentos"), el("b", {}, String(n.n_movimentos))),
             el("span", { class: "bd-linha" }, el("span", {}, "Preparadas (2PC)"), el("b", {}, String(n.n_preparadas))),
             el("span", { class: "bd-linha" }, el("span", {}, "Saldos"), el("b", {}, Object.entries(n.saldos_por_moeda).map(([m, v]) => fmtMoeda(v, m)).join(", ") || "—")),
             el("span", { class: "bd-linha" }, el("span", {}, "WAL (LSN)"), el("b", { class: "mono" }, n.lsn)),
@@ -1042,6 +1056,7 @@ async function verNoBD(no) {
   if (!r.ok) return caixa.append(recibo(r));
   const d = r.dados;
   if (d.estado !== "OK") return caixa.append(el("div", { class: "vazio-msg" }, `${no} não responde: ${d.erro || ""}`));
+  if (d.regiao === "CT") return verCentralBD(caixa, d);
   const tabela = (cols, linhas) => el("div", { class: "rolar" }, el("table", { class: "quadro bd" }, el("thead", {}, el("tr", {}, cols.map((c) => el("th", {}, c)))), el("tbody", {}, linhas)));
   caixa.append(
     el("div", { class: "bd-cab" }, el("h3", {}, `${d.no}`), el("span", { class: "bd-papel" + (d.papel === "primário" ? " prim" : "") }, d.papel),
@@ -1069,6 +1084,35 @@ async function verNoBD(no) {
     el("h4", { class: "bd-tit" }, `Transações preparadas do 2PC (${d.preparadas.length})`),
     d.preparadas.length ? tabela(["Identificador global (gid)", "Preparada desde"], d.preparadas.map((p) => el("tr", {}, el("td", { class: "mono" }, p.gid), el("td", {}, new Date(p.desde).toLocaleString("pt-PT")))))
       : el("p", { class: "nota" }, "Nenhuma: todas as transações distribuídas estão concluídas."));
+}
+function verCentralBD(caixa, d) {
+  const tabela = (cols, linhas) => el("div", { class: "rolar" }, el("table", { class: "quadro bd" }, el("thead", {}, el("tr", {}, cols.map((c) => el("th", {}, c)))), el("tbody", {}, linhas)));
+  const quando = (t) => (t ? new Date(t).toLocaleString("pt-PT", { dateStyle: "short", timeStyle: "medium" }) : "—");
+  const est = d.estado_central || { por_verificar: {}, com_pendentes: {} };
+  const regs = (o) => Object.keys(o).map(nomeRegiao).join(", ");
+  caixa.append(
+    el("div", { class: "bd-cab" }, el("h3", {}, d.no), el("span", { class: "bd-papel" + (d.papel === "primário" ? " prim" : "") }, d.papel),
+      el("span", { class: "nota" }, `Nó Central. WAL na posição ${d.lsn}.`)),
+    el("p", { class: "nota" }, d.papel === "primário" ? (d.replicacao.length
+      ? `Réplica ligada: ${d.replicacao.map((x) => `${x.replica.replace(/_/g, "-")} (${x.estado}, ${x.modo === "sync" ? "síncrona" : x.modo})`).join("; ")}.`
+      : "Sem réplica ligada neste momento.") : "Réplica só de leitura: recebe o WAL do primário da central."),
+    el("p", { class: "nota" }, `Regiões com operações por aplicar: ${regs(est.com_pendentes) || "nenhuma"}. `
+      + `Regiões cujo espelho ainda não foi confirmado: ${regs(est.por_verificar) || "nenhuma"}.`),
+    el("h4", { class: "bd-tit" }, `Tabela espelho (${d.espelho.length} contas, cópia dos saldos das três regiões)`),
+    tabela(["Conta", "Região", "Dono", "Moeda", "Saldo", "Versão", "titular_cifrado (bytes)", "Decifrado pela API", "Atualizado"],
+      d.espelho.map((k) => el("tr", {}, el("td", { class: "id" }, k.id), el("td", {}, nomeRegiao(k.regiao)), el("td", {}, k.owner_username),
+        el("td", {}, k.moeda), el("td", { class: "num" }, fmt(k.saldo)), el("td", { class: "num" }, String(k.versao)),
+        el("td", { class: "mono" }, curtoHex(k.titular_cifrado)), el("td", {}, k.titular_decifrado || "—"), el("td", {}, quando(k.atualizado_em))))),
+    el("h4", { class: "bd-tit" }, "Tabela pendentes (últimas 25 operações autorizadas pela central)"),
+    d.pendentes.length ? tabela(["N.º", "Quando", "Conta", "Tipo", "Valor", "Estado", "Contraparte (decifrada)", "Aplicada"],
+      d.pendentes.map((p) => el("tr", {}, el("td", { class: "num" }, String(p.id)), el("td", {}, quando(p.criado_em)), el("td", { class: "id" }, p.conta),
+        el("td", {}, p.tipo), el("td", { class: "num" }, `${fmt(p.valor)} ${p.moeda}`),
+        el("td", {}, el("span", { class: "bd-papel" + (p.estado === "APLICADA" ? " prim" : "") }, p.estado === "APLICADA" ? "aplicada" : "à espera")),
+        el("td", {}, p.contraparte_decifrada), el("td", {}, p.aplicada_em ? `${quando(p.aplicada_em)} por ${p.aplicada_por}` : "—"))))
+      : el("p", { class: "nota" }, "Nenhuma: ainda nenhuma região precisou do caminho alternativo."),
+    el("h4", { class: "bd-tit" }, "Tabela taxas_cambio (cópia da tabela replicada)"),
+    tabela(["Moeda", "Meticais por unidade", "Atualizada em"], d.taxas.map((t) => el("tr", {}, el("td", { class: "id" }, t.moeda),
+      el("td", { class: "num" }, t.mzn_por_unidade), el("td", {}, quando(t.atualizado_em))))));
 }
 $("btn-bd").addEventListener("click", () => { carregarBD(); if (noBD) verNoBD(noBD); });
 
@@ -1326,12 +1370,48 @@ async function totalDepois(antes) {
 function rasto(r, n = 4) { for (const l of (r.dados && r.dados.rasto ? r.dados.rasto : []).slice(-n)) passo(l, "det"); }
 
 const CENARIOS = [
-  { tipo: "dados", rot: "Base de dados", t: "A América fica sem servidores", d: "Desliga o primário e a réplica da América. A transferência entre regiões é abortada, a Europa continua e as consultas devolvem um resultado parcial.", f: async () => {
+  { tipo: "dados", rot: "Nó Central", t: "A América fica sem os dois servidores", d: "Desliga a réplica e o primário da América. As transferências para e a partir da América continuam pelo Nó Central, que autoriza com base no espelho dos saldos e guarda as operações. Quando a América volta, recebe-as por ordem.", f: async () => {
     const antes = await totalAntes();
     await saudeAgora();
     const fa = fragAmerica(), prim = fa && fa.primario_atual ? fa.primario_atual : "db-america";
     const rep2 = prim === "db-america" ? "db-america-r" : "db-america";
     await no(rep2, "parar"); await no(prim, "parar"); await esperar(2000);   // réplica primeiro: assim não há failover
+    passo("A América não tem nenhum servidor ligado. As operações seguem pelo Nó Central.", "aviso");
+    secao("Transferências com a América em baixo");
+    let r = await transferir("ana", "EU-1003", "AM-2002", "800");
+    passo(`Ana envia 800 MZN para o Diego (destino na América): ${curta(r)}.`, r.ok && r.dados.via_central ? "ok" : "erro"); rasto(r, 4);
+    r = await transferir("diego", "AM-2002", "EU-1003", "300");
+    passo(`Diego envia 300 MZN para a Ana (origem na América): ${curta(r)}.`, r.ok && r.dados.via_central ? "ok" : "erro"); rasto(r, 3);
+    r = await transferir("diego", "AM-2002", "EU-1003", "99999999");
+    passo(`Diego tenta enviar mais do que tem: ${curta(r)}. A central também verifica o saldo.`, r.status === 409 ? "ok" : "erro");
+    r = await chamar("GET", "/contas", { token: await tokenDemo("diego") });
+    const cd = (r.dados.contas || []).find((c) => c.id === "AM-2002");
+    passo(`Saldo do Diego, lido no espelho do Nó Central: ${cd ? fmtMoeda(cd.saldo, cd.moeda) : "?"}.`, cd && cd.via_central ? "ok" : "aviso");
+    const c1 = await chamar("GET", "/admin/bd/db-central", { token: tokenAdmin() });
+    passo(`Operações à espera da América no Nó Central: ${c1.ok ? c1.dados.n_pendentes : "?"}.`, "det");
+    await totalDepois(antes);
+    secao("A América volta");
+    await no(prim, "ligar"); await no(rep2, "ligar");
+    await esperarAte("a América voltou, com réplica síncrona", async () => { await saudeAgora(); const f = fragAmerica(); return f && f.estado === "OK" && Array.isArray(f.replicas) && f.replicas.some((x) => x.modo === "sync"); }, 120);
+    await esperarAte("o Nó Central aplicou na América todas as operações pendentes", async () => {
+      const c = await chamar("GET", "/admin/bd/db-central", { token: tokenAdmin() }); return c.ok && c.dados.n_pendentes === 0; }, 60);
+    for (const api of ["api-1", "api-2"]) {
+      const lg = await chamar("GET", `/controlo/logs/${api}`, { token: tokenAdmin(), consulta: { linhas: "120" } });
+      for (const l of (lg.dados.linhas || []).filter((x) => /\[central\] AM:.*aplicada/.test(x)).slice(-4)) passo(l.replace(/^.*?\[central\]\s*/, "Reconciliação: "), "det");
+    }
+    r = await chamar("GET", "/contas/AM-2002/extracto", { token: await tokenDemo("diego") });
+    const ult = r.ok ? r.dados.movimentos.slice(-2) : [];
+    for (const m of ult) passo(`Extrato do Diego, já na América: ${m.descricao}, ${m.debito ? "−" + fmt(m.debito) : "+" + fmt(m.credito)} MZN (${m.protocolo}).`, "det");
+    await totalDepois(antes);
+  } },
+  { tipo: "dados", rot: "Base de dados", t: "A América e o Nó Central em baixo", d: "Desliga a América e também o Nó Central. Sem caminho alternativo, a transferência para a América é abortada, a Europa continua e as consultas devolvem um resultado parcial.", f: async () => {
+    const antes = await totalAntes();
+    await saudeAgora();
+    const fa = fragAmerica(), prim = fa && fa.primario_atual ? fa.primario_atual : "db-america";
+    const rep2 = prim === "db-america" ? "db-america-r" : "db-america";
+    const fc = saudeAtual && porRegiao(saudeAtual.fragmentos, "Central"), pc = fc && fc.primario_atual ? fc.primario_atual : "db-central";
+    const rc = pc === "db-central" ? "db-central-r" : "db-central";
+    await no(rc, "parar"); await no(pc, "parar"); await no(rep2, "parar"); await no(prim, "parar"); await esperar(2000);
     let r = await transferir("ana", "EU-1001", "AM-2001", "20"); passo(`Transferência EU-1001 → AM-2001: ${curta(r)}.`, r.status === 503 ? "ok" : "erro");
     r = await transferir("ana", "EU-1001", "EU-1003", "5"); passo(`Transferência dentro da Europa: ${curta(r)}.`, r.ok ? "ok" : "erro");
     r = await chamar("GET", "/contas", { token: tokenAdmin() });
@@ -1340,8 +1420,9 @@ const CENARIOS = [
     const eu = tx.ok ? porRegiao(tx.dados.mzn_por_unidade, "Europa") : null;
     r = await chamar("PUT", "/admin/taxas/EUR", { token: tokenAdmin(), corpo: { mzn_por_unidade: String(eu && eu.EUR ? eu.EUR : "69.50") } });
     passo(`Alterar a taxa do EUR com uma cópia em baixo: ${curta(r)}. Nenhuma cópia muda.`, r.ok ? "erro" : "ok");
-    await no(prim, "ligar"); await no(rep2, "ligar");
-    await esperarAte("a América voltou, com réplica síncrona", async () => { await saudeAgora(); const f = fragAmerica(); return f && f.estado === "OK" && Array.isArray(f.replicas) && f.replicas.some((x) => x.modo === "sync"); }, 120);
+    await no(pc, "ligar"); await no(rc, "ligar"); await no(prim, "ligar"); await no(rep2, "ligar");
+    await esperarAte("a América e o Nó Central voltaram, com réplicas síncronas", async () => { await saudeAgora();
+      return ["América", "Central"].every((g) => { const f = porRegiao(saudeAtual.fragmentos, g); return f && f.estado === "OK" && Array.isArray(f.replicas) && f.replicas.some((x) => x.modo === "sync"); }); }, 150);
     await totalDepois(antes);
   } },
   { tipo: "2pc", rot: "Two-Phase Commit", t: "Rede falha na fase 1", d: "Um participante fica inacessível durante a preparação. O coordenador decide ABORT e desfaz o que já estava preparado.", f: async () => {

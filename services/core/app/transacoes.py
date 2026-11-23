@@ -13,6 +13,8 @@ Implementa:
     o sistema legado do banco parceiro não suporta 2PC.
   * Recuperação automática após falhas (registo durável do coordenador + regra
     "presumed abort").
+  * Caminho alternativo pelo NÓ CENTRAL quando uma região inteira (primário e
+    réplica) está em baixo — ver central.py.
 
 Garantia das propriedades ACID na transação distribuída
 -------------------------------------------------------
@@ -42,7 +44,7 @@ from pathlib import Path
 
 import psycopg
 
-from . import config, legado
+from . import central, config, legado
 from .cripto import cifrar, ctx_contraparte
 from .security import sha256_hex
 from .shards import ESPERA_FAILOVER_S, ContaInexistente, FragmentoIndisponivel, ligar, shard_de
@@ -170,14 +172,10 @@ def verificar_debito(linha: dict, valor: Decimal, utilizador) -> None:
 def movimentar(c, conta: str, tipo: str, valor: Decimal, moeda: str, tx_id, contraparte: str,
                hash_tx: str, protocolo: str, conv: dict | None = None, lado: str = "origem"):
     sinal = "-" if tipo in ("DEBITO", "DEBITO_EXTERNO") else "+"
-    c.execute(f"UPDATE contas SET saldo = saldo {sinal} %s, versao = versao + 1, "
-              f"atualizado_em = now() WHERE id = %s", (valor, conta))
-    vc = mc = taxa = None
-    if conv and conv["moeda_origem"] != conv["moeda_destino"]:
-        if lado == "origem":
-            vc, mc, taxa = conv["valor_destino"], conv["moeda_destino"], conv["taxa"]
-        else:
-            vc, mc, taxa = conv["valor_origem"], conv["moeda_origem"], conv["taxa"]
+    linha = c.execute(f"UPDATE contas SET saldo = saldo {sinal} %s, versao = versao + 1, "
+                      f"atualizado_em = now() WHERE id = %s RETURNING id, regiao, moeda, owner_username, "
+                      f"titular_cifrado, saldo, versao", (valor, conta)).fetchone()
+    vc, mc, taxa = _lado_conversao(conv, lado)
     try:
         c.execute(
             "INSERT INTO movimentos (tx_id, conta_id, tipo, valor, moeda, valor_contraparte, "
@@ -186,6 +184,29 @@ def movimentar(c, conta: str, tipo: str, valor: Decimal, moeda: str, tx_id, cont
             (tx_id, conta, tipo, valor, moeda, vc, mc, taxa,
              cifrar(contraparte, ctx_contraparte(tx_id, conta, tipo)),   # IBAN/conta cifrados
              hash_tx, protocolo, config.NODE_ID))
+    except psycopg.errors.UniqueViolation:
+        raise TransacaoDuplicada(f"A transação {tx_id} já foi processada (proteção anti-replay / "
+                                 f"idempotência)")
+    return linha       # saldo e versão novos: publicados no espelho do Nó Central após o COMMIT
+
+
+def _lado_conversao(conv: dict | None, lado: str):
+    """Valor equivalente na moeda da outra conta, guardado no movimento (rasto da conversão)."""
+    if conv and conv["moeda_origem"] != conv["moeda_destino"]:
+        if lado == "origem":
+            return conv["valor_destino"], conv["moeda_destino"], conv["taxa"]
+        return conv["valor_origem"], conv["moeda_origem"], conv["taxa"]
+    return None, None, None
+
+
+def movimentar_central(c, conta: str, regiao: str, tipo: str, valor: Decimal, moeda: str, tx_id,
+                       contraparte: str, hash_tx: str, conv: dict | None = None, lado: str = "origem"):
+    """Mesmo movimento, mas autorizado pelo NÓ CENTRAL em nome de uma região em baixo:
+    o saldo muda no espelho e a operação fica pendente até a região voltar."""
+    vc, mc, taxa = _lado_conversao(conv, lado)
+    try:
+        central.registar(c, conta, regiao, tipo, valor, moeda, tx_id,
+                         cifrar(contraparte, ctx_contraparte(tx_id, conta, tipo)), hash_tx, vc, mc, taxa)
     except psycopg.errors.UniqueViolation:
         raise TransacaoDuplicada(f"A transação {tx_id} já foi processada (proteção anti-replay / "
                                  f"idempotência)")
@@ -219,6 +240,12 @@ class Coordenador:
         if valor <= 0:
             raise ValueError("O valor tem de ser positivo")
         so, sd = shard_de(origem), shard_de(destino)
+        em_baixo = {s: central.regiao_em_baixo(s) for s in {so, sd}}
+        if any(em_baixo.values()):
+            return self._transferencia_via_central(tx["id"], origem, destino, valor, so, sd, em_baixo,
+                                                   utilizador, hash_tx)
+        for s in {so, sd}:
+            central.garantir_reconciliada(s)
         if so == sd:
             return self._transferencia_local(tx["id"], origem, destino, valor, so, utilizador,
                                              hash_tx)
@@ -234,10 +261,12 @@ class Coordenador:
                 lo, ld = linhas[origem], linhas[destino]
                 verificar_debito(lo, valor, utilizador)
                 conv = converter(valor, lo["moeda"], ld["moeda"], ler_taxas(c, [lo["moeda"], ld["moeda"]]))
-                movimentar(c, origem, "DEBITO", valor, lo["moeda"], tx_id, destino, hash_tx,
-                           "LOCAL", conv, "origem")
-                movimentar(c, destino, "CREDITO", conv["valor_destino"], ld["moeda"], tx_id,
-                           origem, hash_tx, "LOCAL", conv, "destino")
+                alteradas = [
+                    movimentar(c, origem, "DEBITO", valor, lo["moeda"], tx_id, destino, hash_tx,
+                               "LOCAL", conv, "origem"),
+                    movimentar(c, destino, "CREDITO", conv["valor_destino"], ld["moeda"], tx_id,
+                               origem, hash_tx, "LOCAL", conv, "destino")]
+        central.publicar(alteradas)
         self.auditoria.registar("TRANSFERENCIA_LOCAL", tx_id=tx_id, origem=origem,
                                 destino=destino, **{k: str(v) for k, v in conv.items()},
                                 hash=hash_tx, utilizador=utilizador.username)
@@ -259,6 +288,7 @@ class Coordenador:
         conexoes: dict[str, psycopg.Connection] = {}
         linhas: dict[str, dict] = {}
         preparados: list[str] = []
+        alteradas: list[dict] = []
         conv = None
 
         with self.lock:
@@ -299,12 +329,12 @@ class Coordenador:
                     shard, p = papel[conta]
                     c = conexoes[shard]
                     if p == "origem":
-                        movimentar(c, origem, "DEBITO", valor, lo["moeda"], tx_id, destino,
-                                   hash_tx, "2PC", conv, "origem")
+                        alteradas.append(movimentar(c, origem, "DEBITO", valor, lo["moeda"], tx_id, destino,
+                                                    hash_tx, "2PC", conv, "origem"))
                         r(f"FASE 1: DEBITO de {valor} {lo['moeda']} em {origem} executado em {shard}")
                     else:
-                        movimentar(c, destino, "CREDITO", conv["valor_destino"], ld["moeda"],
-                                   tx_id, origem, hash_tx, "2PC", conv, "destino")
+                        alteradas.append(movimentar(c, destino, "CREDITO", conv["valor_destino"], ld["moeda"],
+                                                    tx_id, origem, hash_tx, "2PC", conv, "destino"))
                         r(f"FASE 1: CREDITO de {conv['valor_destino']} {ld['moeda']} em {destino} "
                           f"executado em {shard}")
                     c.tpc_prepare()                     # PREPARE TRANSACTION -> voto SIM
@@ -360,6 +390,7 @@ class Coordenador:
             else:
                 self.wal.escrever(gtrid, "CONCLUIDO")
                 estado = "CONFIRMADA"
+            central.publicar(alteradas)      # decisão COMMIT: estes saldos são os definitivos
             self.auditoria.registar("2PC_COMMIT", tx_id=tx_id, origem=origem, destino=destino,
                                     **{k: str(v) for k, v in conv.items()}, hash=hash_tx,
                                     pendentes=pendentes, utilizador=utilizador.username)
@@ -376,11 +407,132 @@ class Coordenador:
             with self.lock:
                 self.em_curso.discard(gtrid)
 
+    # ------------------------------------------- Caminho alternativo: NÓ CENTRAL
+    def _transferencia_via_central(self, tx_id, origem, destino, valor, so, sd, em_baixo, utilizador,
+                                   hash_tx):
+        """Uma das regiões (ou as duas) tem os DOIS nós em baixo. A central autoriza a parte
+        dessa região com base no espelho dos saldos e guarda-a como pendente.
+          * as duas pontas na central  -> uma transação ACID local na central;
+          * uma ponta viva             -> Two-Phase Commit entre a central e essa região."""
+        CT = config.CENTRAL
+        gtrid = f"{config.NODE_ID}|{tx_id}"
+        rasto: list[str] = []
+
+        def r(msg):
+            rasto.append(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}")
+
+        for s, baixo in em_baixo.items():
+            if baixo:
+                r(f"Região {central.NOMES_REGIAO[s]}: os dois nós ({' e '.join(config.NOS_FRAGMENTO[s])}) "
+                  f"não respondem -> a parte desta região segue pelo NÓ CENTRAL")
+                central.pode_substituir(s)
+            else:
+                central.garantir_reconciliada(s)
+        onde = {origem: CT if em_baixo[so] else so, destino: CT if em_baixo[sd] else sd}
+        regiao = {origem: so, destino: sd}
+        participantes = sorted(set(onde.values()))
+        dois_pc = len(participantes) > 1
+        conexoes: dict[str, psycopg.Connection] = {}
+        alteradas: list[dict] = []
+        with self.lock:
+            self.em_curso.add(gtrid)
+        self.wal.escrever(gtrid, "INICIO", participantes=participantes, origem=origem, destino=destino,
+                          valor=str(valor), via="CENTRAL")
+        r(f"COORDENADOR {config.NODE_ID}: participantes {', '.join(config.SHARD_NOMES[p] for p in participantes)}"
+          + (" (Two-Phase Commit)" if dois_pc else " (transação local na central)"))
+        try:
+            try:
+                for p in participantes:
+                    c = ligar(p, esperar=ESPERA_FAILOVER_S)
+                    conexoes[p] = c
+                    if dois_pc:
+                        c.tpc_begin(c.xid(self.FORMAT_ID, gtrid, p))
+                linhas = {}
+                for conta in sorted([origem, destino]):          # ordem global de bloqueio
+                    p, papel = onde[conta], "origem" if conta == origem else "destino"
+                    linhas[conta] = (central.bloquear(conexoes[p], conta, papel) if p == CT
+                                     else bloquear_conta(conexoes[p], conta, papel))
+                    r(f"conta {conta} bloqueada " + ("no ESPELHO da central (saldo "
+                      f"{linhas[conta]['saldo']} {linhas[conta]['moeda']})" if p == CT else f"em {p}"))
+                lo, ld = linhas[origem], linhas[destino]
+                verificar_debito(lo, valor, utilizador)
+                moedas = [lo["moeda"], ld["moeda"]]
+                taxas = [ler_taxas(conexoes[p], moedas) for p in participantes]
+                if any(t != taxas[0] for t in taxas):
+                    raise TaxasInconsistentes(f"Réplicas de taxas_cambio divergem: {taxas}")
+                conv = converter(valor, lo["moeda"], ld["moeda"], taxas[0])
+                for conta, tipo, v, m, contra, lado in (
+                        (origem, "DEBITO", valor, lo["moeda"], destino, "origem"),
+                        (destino, "CREDITO", conv["valor_destino"], ld["moeda"], origem, "destino")):
+                    p = onde[conta]
+                    if p == CT:
+                        movimentar_central(conexoes[CT], conta, regiao[conta], tipo, v, m, tx_id, contra,
+                                           hash_tx, conv, lado)
+                        r(f"CENTRAL: {tipo} de {v} {m} em {conta} autorizado e guardado como PENDENTE "
+                          f"(aplicado quando a {central.NOMES_REGIAO[regiao[conta]]} voltar)")
+                    else:
+                        alteradas.append(movimentar(conexoes[p], conta, tipo, v, m, tx_id, contra, hash_tx,
+                                                    "2PC", conv, lado))
+                        r(f"{p}: {tipo} de {v} {m} em {conta} executado")
+                # a região passa a ter operações por aplicar (marcado ANTES do commit)
+                central.marcar("com_pendentes", [regiao[k] for k in (origem, destino) if onde[k] == CT])
+                if dois_pc:
+                    for p in participantes:
+                        conexoes[p].tpc_prepare()
+                        r(f"FASE 1: {config.SHARD_NOMES[p]} respondeu PREPARED (voto SIM)")
+            except Exception as e:
+                self.wal.escrever(gtrid, "ABORT", motivo=str(e)[:300])
+                r(f"DECISÃO: ABORT ({type(e).__name__}: {e})")
+                for p, c in conexoes.items():
+                    try:
+                        c.tpc_rollback() if dois_pc else c.rollback()
+                    except Exception:
+                        pass
+                self.wal.escrever(gtrid, "CONCLUIDO")
+                e.rasto = rasto  # type: ignore[attr-defined]
+                raise
+            self.wal.escrever(gtrid, "COMMIT")
+            r("DECISÃO: COMMIT gravada no registo durável do coordenador (fsync)")
+            falhados = []
+            for p, c in conexoes.items():
+                try:
+                    c.tpc_commit() if dois_pc else c.commit()
+                    r(("FASE 2: COMMIT PREPARED em " if dois_pc else "COMMIT em ") + f"{config.SHARD_NOMES[p]} ✓")
+                except Exception as e:
+                    falhados.append(p)
+                    r(f"FASE 2: {p} inacessível ({type(e).__name__}); a recuperação conclui")
+            if not falhados:
+                self.wal.escrever(gtrid, "CONCLUIDO")
+        finally:
+            for c in conexoes.values():
+                try:
+                    c.close()
+                except Exception:
+                    pass
+            with self.lock:
+                self.em_curso.discard(gtrid)
+        central.publicar(alteradas)
+        self.auditoria.registar("TRANSFERENCIA_VIA_CENTRAL", tx_id=tx_id, origem=origem, destino=destino,
+                                **{k: str(v) for k, v in conv.items()}, hash=hash_tx,
+                                regioes_em_baixo=[s for s, b in em_baixo.items() if b],
+                                utilizador=utilizador.username)
+        a_aguardar = [f"{k}: {'débito' if k == origem else 'crédito'} de "
+                      f"{valor if k == origem else conv['valor_destino']} "
+                      f"{lo['moeda'] if k == origem else ld['moeda']}, aplicado quando a "
+                      f"{central.NOMES_REGIAO[regiao[k]]} voltar" for k in (origem, destino) if onde[k] == CT]
+        return {"tx_id": tx_id, "estado": "CONFIRMADA_PENDENTE" if falhados else "CONFIRMADA",
+                "protocolo": "Via NÓ CENTRAL" + (" (Two-Phase Commit central + região)" if dois_pc
+                                                 else " (transação local na central)"),
+                "via_central": True, "regioes_em_baixo": [s for s, b in em_baixo.items() if b],
+                "coordenador": config.NODE_ID, "participantes": participantes,
+                "origem": origem, "destino": destino, "conversao": _resumo(conv),
+                "a_aguardar_regiao": a_aguardar, "rasto": rasto}
+
     # ------------------------------------------- Taxas de câmbio (replicação 2PC)
     def taxas(self) -> dict:
         """Lê as taxas em TODAS as réplicas e indica se estão coerentes."""
         por_no = {}
-        for shard in config.SHARDS:
+        for shard in [*config.SHARDS, config.CENTRAL]:
             try:
                 with ligar(shard, autocommit=True) as c:
                     por_no[config.SHARD_NOMES[shard]] = {
@@ -401,7 +553,7 @@ class Coordenador:
         if mzn_por_unidade <= 0:
             raise ValueError("A taxa tem de ser positiva")
         gtrid = f"{config.NODE_ID}|taxa-{uuid.uuid4()}"
-        participantes = sorted(config.SHARDS)
+        participantes = sorted([*config.SHARDS, config.CENTRAL])   # a central também tem a tabela
         conexoes, rasto = {}, []
         with self.lock:
             self.em_curso.add(gtrid)
@@ -454,22 +606,51 @@ class Coordenador:
         conservação do dinheiro, usado para demonstrar a atomicidade)."""
         por_moeda: dict[str, Decimal] = {}
         taxas = None
-        falhas = []
-        for shard in config.SHARDS:
+        falhas, pela_central = [], []
+
+        def somar(m, v):
+            m = m.strip()
+            por_moeda[m] = por_moeda.get(m, Decimal(0)) + v
+
+        cc = None
+        if not central.regiao_em_baixo(config.CENTRAL):
             try:
-                with ligar(shard, autocommit=True) as c:
-                    for l in c.execute("SELECT moeda, sum(saldo) AS s FROM contas GROUP BY moeda"):
-                        m = l["moeda"].strip()
-                        por_moeda[m] = por_moeda.get(m, Decimal(0)) + l["s"]
-                    if taxas is None:
-                        taxas = {l["moeda"].strip(): l["mzn_por_unidade"] for l in c.execute(
-                            "SELECT moeda, mzn_por_unidade FROM taxas_cambio")}
+                cc = ligar(config.CENTRAL, autocommit=True)
             except FragmentoIndisponivel:
-                falhas.append(config.SHARD_NOMES[shard])
+                cc = None
+        try:
+            for shard in config.SHARDS:
+                try:
+                    if central.regiao_em_baixo(shard):
+                        raise FragmentoIndisponivel(shard, RuntimeError("os dois nós em baixo"))
+                    with ligar(shard, autocommit=True) as c:
+                        for l in c.execute("SELECT moeda, sum(saldo) AS s FROM contas GROUP BY moeda"):
+                            somar(l["moeda"], l["s"])
+                        if taxas is None:
+                            taxas = {l["moeda"].strip(): l["mzn_por_unidade"] for l in c.execute(
+                                "SELECT moeda, mzn_por_unidade FROM taxas_cambio")}
+                    if cc:      # operações da central ainda por aplicar nesta região
+                        for m, v in central.efeitos_pendentes(cc, shard).items():
+                            somar(m, v)
+                except FragmentoIndisponivel:
+                    if cc is None:
+                        falhas.append(config.SHARD_NOMES[shard])
+                        continue
+                    # região em baixo: o saldo das suas contas está no espelho da central
+                    for l in cc.execute("SELECT moeda, sum(saldo) AS s FROM espelho WHERE regiao = %s "
+                                        "GROUP BY moeda", (shard,)):
+                        somar(l["moeda"], l["s"])
+                    pela_central.append(config.SHARD_NOMES[shard])
+            if taxas is None and cc:
+                taxas = {l["moeda"].strip(): l["mzn_por_unidade"] for l in cc.execute(
+                    "SELECT moeda, mzn_por_unidade FROM taxas_cambio")}
+        finally:
+            if cc:
+                cc.close()
         total = sum((v * taxas[m] for m, v in por_moeda.items()), Decimal(0)) if taxas else None
         return {"saldos_por_moeda": {m: str(v) for m, v in sorted(por_moeda.items())},
                 "total_equivalente_MZN": str(total.quantize(CENTIMO)) if total is not None else None,
-                "fragmentos_indisponiveis": falhas}
+                "fragmentos_indisponiveis": falhas, "servidos_pela_central": pela_central}
 
     # ------------------------------------------------------------------ SAGA
     def ordem_interbancaria(self, o: dict, utilizador, hash_tx: str, falha=None) -> dict:
@@ -486,22 +667,38 @@ class Coordenador:
         contraparte = f"{o['banco_destino']}:{o['iban_destino']}"
 
         # ---- T1: débito local (transação ACID local, confirmada)
+        #      Se a região da conta estiver em baixo, o débito é autorizado pelo NÓ CENTRAL.
         conv = None
-        with ligar(shard, esperar=ESPERA_FAILOVER_S) as c:
+        via_central = central.regiao_em_baixo(shard)
+        if via_central:
+            central.pode_substituir(shard)
+            rasto.append(f"Região {central.NOMES_REGIAO[shard]} em baixo: o débito é autorizado pelo NÓ CENTRAL")
+        else:
+            central.garantir_reconciliada(shard)
+        with ligar(config.CENTRAL if via_central else shard, esperar=ESPERA_FAILOVER_S) as c:
             with c.transaction():
-                linha = bloquear_conta(c, conta, "origem")
+                linha = (central.bloquear(c, conta, "origem") if via_central
+                         else bloquear_conta(c, conta, "origem"))
                 verificar_debito(linha, valor, utilizador)
                 if carteira and linha["moeda"] != "MZN":
                     # As carteiras móveis só recebem meticais: converte-se com a taxa
                     # da tabela replicada, lida dentro desta transação (FOR SHARE).
                     conv = converter(valor, linha["moeda"], "MZN", ler_taxas(c, [linha["moeda"], "MZN"]))
-                movimentar(c, conta, "DEBITO_EXTERNO", valor, linha["moeda"], tx_id, contraparte,
-                           hash_tx, "SAGA", conv=conv)
+                if via_central:
+                    central.marcar("com_pendentes", [shard])
+                    movimentar_central(c, conta, shard, "DEBITO_EXTERNO", valor, linha["moeda"], tx_id,
+                                       contraparte, hash_tx, conv=conv)
+                    alterada = None
+                else:
+                    alterada = movimentar(c, conta, "DEBITO_EXTERNO", valor, linha["moeda"], tx_id,
+                                          contraparte, hash_tx, "SAGA", conv=conv)
+        central.publicar([alterada])
         moeda = linha["moeda"]
         valor_envio, moeda_envio = (conv["valor_destino"], "MZN") if conv else (valor, moeda)
         self.saga_log.escrever(tx_id, "T1_DEBITO_OK", conta=conta, valor=str(valor), moeda=moeda,
                                shard=shard, contraparte=contraparte, hash=hash_tx)
-        rasto.append(f"SAGA T1: débito de {valor} {moeda} em {conta} confirmado em {shard}"
+        rasto.append(f"SAGA T1: débito de {valor} {moeda} em {conta} confirmado em "
+                     f"{'db-central (pendente)' if via_central else shard}"
                      + (f" (convertido para {valor_envio} MZN)" if conv else ""))
 
         # ---- T2: mensagem XML assinada para o sistema legado (Java)
@@ -524,6 +721,7 @@ class Coordenador:
                                         valor=str(valor), moeda=moeda, hash=hash_tx,
                                         autorizacao=resp.get("CodigoAutorizacao"))
                 return {"tx_id": tx_id, "estado": "CONCLUIDA", "protocolo": "SAGA",
+                        "via_central": via_central,
                         "destino_tipo": "CARTEIRA" if carteira else "IBAN",
                         "titular_destino": resp.get("Titular"),
                         "enviado": f"{valor_envio:.2f} {moeda_envio}",
@@ -551,17 +749,34 @@ class Coordenador:
                   "por": utilizador.username}
         hash_tx = sha256_hex(json.dumps(campos, sort_keys=True, separators=(",", ":"),
                                         ensure_ascii=False).encode())
-        with ligar(shard, esperar=ESPERA_FAILOVER_S) as c:
+        via_central = central.regiao_em_baixo(shard)
+        if via_central:
+            central.pode_substituir(shard)
+        else:
+            central.garantir_reconciliada(shard)
+        alterada = None
+        with ligar(config.CENTRAL if via_central else shard, esperar=ESPERA_FAILOVER_S) as c:
             with c.transaction():
-                linha = bloquear_conta(c, conta, "destino")
-                movimentar(c, conta, "DEPOSITO", valor, linha["moeda"], tx_id,
-                           f"DEPOSITO:{descricao}", hash_tx, "LOCAL")
-                saldo = c.execute("SELECT saldo FROM contas WHERE id = %s", (conta,)).fetchone()["saldo"]
+                if via_central:      # região em baixo: o depósito fica pendente na central
+                    linha = central.bloquear(c, conta, "destino")
+                    central.marcar("com_pendentes", [shard])
+                    movimentar_central(c, conta, shard, "DEPOSITO", valor, linha["moeda"], tx_id,
+                                       f"DEPOSITO:{descricao}", hash_tx)
+                    saldo = c.execute("SELECT saldo FROM espelho WHERE conta = %s", (conta,)).fetchone()["saldo"]
+                else:
+                    linha = bloquear_conta(c, conta, "destino")
+                    alterada = movimentar(c, conta, "DEPOSITO", valor, linha["moeda"], tx_id,
+                                          f"DEPOSITO:{descricao}", hash_tx, "LOCAL")
+                    saldo = alterada["saldo"]
+        central.publicar([alterada])
         self.auditoria.registar("DEPOSITO", tx_id=tx_id, conta=conta, valor=str(valor),
                                 moeda=linha["moeda"], por=utilizador.username, hash=hash_tx)
-        return {"tx_id": tx_id, "estado": "CONFIRMADA", "protocolo": "LOCAL (depósito)",
+        return {"tx_id": tx_id, "estado": "CONFIRMADA",
+                "protocolo": "Via NÓ CENTRAL (depósito pendente até a região voltar)" if via_central
+                else "LOCAL (depósito)", "via_central": via_central,
                 "conta": conta, "valor": f"{valor:.2f}", "moeda": linha["moeda"],
-                "saldo_atual": str(saldo), "fragmento": config.SHARD_NOMES[shard]}
+                "saldo_atual": str(saldo),
+                "fragmento": config.SHARD_NOMES[config.CENTRAL if via_central else shard]}
 
     def abrir_conta(self, owner: str, titular: str, regiao: str, moeda: str, utilizador) -> dict:
         """Abre uma conta nova no fragmento da região (só o administrador)."""
@@ -581,21 +796,35 @@ class Coordenador:
                 ult = c.execute("SELECT max(split_part(id, '-', 2)::int) AS n FROM contas").fetchone()["n"]
                 numero = max(ult or base, base) + 1
                 conta = f"{regiao}-{numero}"
-                c.execute("INSERT INTO contas (id, titular, titular_cifrado, owner_username, regiao, "
-                          "moeda, saldo) VALUES (%s, NULL, %s, %s, %s, %s, 0)",
-                          (conta, cifrar(titular, ctx_titular(conta)), owner, regiao, moeda))
+                nova = c.execute("INSERT INTO contas (id, titular, titular_cifrado, owner_username, regiao, "
+                                 "moeda, saldo) VALUES (%s, NULL, %s, %s, %s, %s, 0) RETURNING id, regiao, "
+                                 "moeda, owner_username, titular_cifrado, saldo, versao",
+                                 (conta, cifrar(titular, ctx_titular(conta)), owner, regiao, moeda)).fetchone()
+        central.publicar([nova])
         self.auditoria.registar("CONTA_ABERTA", conta=conta, titular_cifrado=True, owner=owner,
                                 moeda=moeda, por=utilizador.username)
         return {"conta": conta, "titular": titular, "owner_username": owner, "regiao": regiao,
                 "moeda": moeda, "saldo": "0.00", "fragmento": config.SHARD_NOMES[regiao]}
 
     def _compensar(self, tx_id, conta, valor, shard, contraparte, hash_tx, motivo):
+        shard = shard_de(conta)              # região da conta (o T1 pode ter sido feito na central)
         try:
-            with ligar(shard) as c:
-                with c.transaction():
-                    linha = bloquear_conta(c, conta, "origem")
-                    movimentar(c, conta, "COMPENSACAO", valor, linha["moeda"], tx_id, contraparte,
-                               hash_tx, "SAGA")
+            if central.regiao_em_baixo(shard):
+                # a região continua em baixo: o estorno também fica pendente na central
+                with ligar(config.CENTRAL) as c:
+                    with c.transaction():
+                        linha = central.bloquear(c, conta, "origem")
+                        central.marcar("com_pendentes", [shard])
+                        movimentar_central(c, conta, shard, "COMPENSACAO", valor, linha["moeda"], tx_id,
+                                           contraparte, hash_tx)
+            else:
+                central.garantir_reconciliada(shard)
+                with ligar(shard) as c:
+                    with c.transaction():
+                        linha = bloquear_conta(c, conta, "origem")
+                        alterada = movimentar(c, conta, "COMPENSACAO", valor, linha["moeda"], tx_id,
+                                              contraparte, hash_tx, "SAGA")
+                central.publicar([alterada])
         except TransacaoDuplicada:
             pass                                    # compensação já feita (idempotente)
         self.saga_log.escrever(tx_id, "COMPENSADA", motivo=motivo)
@@ -619,7 +848,10 @@ class Coordenador:
         estados_peers = {p: RegistoDuravel(config.DATA_DIR / f"coordenador-2pc-{p}.log").estados()
                          for p in mortos}
 
-        for shard in config.SHARDS:
+        for shard in [*config.SHARDS, config.CENTRAL]:
+            if central.regiao_em_baixo(shard):
+                acoes.append(f"{shard}: indisponível — nova tentativa no próximo ciclo")
+                continue
             try:
                 c = ligar(shard, autocommit=True)
             except FragmentoIndisponivel:
