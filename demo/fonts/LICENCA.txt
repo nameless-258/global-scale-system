@@ -1,0 +1,2 @@
+Archivo (Omnibus-Type) e JetBrains Mono (JetBrains) — SIL Open Font License 1.1.
+Ficheiros obtidos dos pacotes @fontsource-variable/archivo e @fontsource/jetbrains-mono.

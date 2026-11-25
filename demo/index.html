@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Global-Scale System — Consola de operação (demonstração)</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="demo.css">
+</head>
+<body>
+<div class="faixa-demo" role="note"><span><b>Demonstração.</b> Esta página simula o sistema no próprio browser:
+não há servidores, bases de dados nem HDFS por trás, e os dados recomeçam quando recarrega a página.</span>
+<a href="https://github.com/nameless-258/global-scale-system">O sistema real corre com Docker: ver o repositório</a></div>
+
+<header class="barra">
+  <div class="marca">
+    <svg class="selo-marca" viewBox="0 0 40 40" aria-hidden="true">
+      <circle cx="20" cy="20" r="18" fill="none" stroke="currentColor" stroke-width="1.5"/>
+      <circle cx="20" cy="20" r="12.5" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2.4"/>
+      <path d="M7 20h26M20 7c-6 7-6 19 0 26M20 7c6 7 6 19 0 26" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    </svg>
+    <div>
+      <span class="marca-nome">Global-Scale System</span>
+      <span class="marca-sub">Consola de operação da rede de transações</span>
+    </div>
+  </div>
+  <div class="utilizador" id="utilizador">
+    <button class="pilula" id="pilula" type="button" aria-haspopup="true" aria-expanded="false">
+      <span class="pil-ini" id="pil-ini" aria-hidden="true">?</span>
+      <span class="pil-texto"><span class="pil-nome" id="pil-nome">Entrar</span><span class="pil-papel" id="pil-papel">ninguém com sessão</span></span>
+    </button>
+    <div class="pil-menu" id="pil-menu" hidden>
+      <p id="pil-menu-info"></p>
+      <button class="discreto" id="btn-sair" type="button">Terminar sessão</button>
+    </div>
+  </div>
+</header>
+
+<!-- ======================================================= MAPA AO VIVO -->
+<section class="palco" aria-label="Estado da rede ao vivo">
+  <div class="palco-mapa">
+    <div class="palco-cab">
+      <h1>A rede, agora</h1>
+      <p id="mapa-legenda">A ler o estado dos nós…</p>
+    </div>
+    <svg id="mapa" viewBox="0 0 1000 475" role="img" aria-label="Topologia do sistema"></svg>
+    <ul class="legenda-cores" aria-label="Legenda">
+      <li><i class="c-ok"></i>a funcionar</li>
+      <li><i class="c-aviso"></i>degradado</li>
+      <li><i class="c-falha"></i>em baixo</li>
+      <li><i class="c-vedado"></i>vedado</li>
+      <li class="dica" id="mapa-dica"></li>
+    </ul>
+  </div>
+  <aside class="livro">
+    <h2 id="livro-titulo">Dinheiro no sistema</h2>
+    <div id="livro-total" class="livro-total">—</div>
+    <div class="livro-moeda" id="livro-moeda">equivalente em meticais</div>
+    <dl id="livro-moedas" class="livro-moedas"></dl>
+    <div id="livro-conservacao" class="livro-conservacao"></div>
+    <h2 class="livro-ev">Acontecimentos</h2>
+    <ol id="eventos" class="eventos"></ol>
+  </aside>
+</section>
+
+<div class="corpo">
+  <nav class="menu" id="menu" aria-label="Secções">
+    <!-- Cliente -->
+    <p class="menu-grupo" data-papel="cliente">O meu banco</p>
+    <button data-sep="inicio" data-papel="cliente">Início</button>
+    <button data-sep="transferir" data-papel="cliente">Transferir</button>
+    <button data-sep="extrato" data-papel="cliente">Extrato</button>
+    <p class="menu-grupo" data-papel="cliente">Pôr à prova</p>
+    <button data-sep="seguranca" data-papel="cliente">Ataques</button>
+    <!-- Administrador -->
+    <p class="menu-grupo" data-papel="admin">Gestão</p>
+    <button data-sep="clientes" data-papel="admin">Clientes e contas</button>
+    <button data-sep="depositar" data-papel="admin">Depositar</button>
+    <p class="menu-grupo" data-papel="admin">Supervisão</p>
+    <button data-sep="bd" data-papel="admin">Bases de dados</button>
+    <button data-sep="cenarios" data-papel="admin">Cenários de falha</button>
+    <button data-sep="admin" data-papel="admin">Coordenador 2PC</button>
+    <button data-sep="dfs" data-papel="admin">Ficheiros no HDFS</button>
+    <!-- Ambos -->
+    <p class="menu-grupo" data-papel="ambos">Informação</p>
+    <button data-sep="cambio" data-papel="ambos">Câmbio</button>
+  </nav>
+
+  <main>
+    <!-- ===================================================== SEM SESSÃO -->
+    <section class="painel" id="sep-entrada">
+      <header class="painel-cab">
+        <h2>Bem-vindo</h2>
+        <p>O mapa acima mostra a rede em tempo real. Para movimentar contas, entre como cliente; para supervisionar o sistema e simular falhas, entre como administrador.</p>
+      </header>
+      <button class="acao" id="btn-entrar-grande" type="button">Entrar</button>
+    </section>
+
+    <!-- ===================================================== CLIENTE: INÍCIO -->
+    <section class="painel" id="sep-inicio" hidden>
+      <header class="painel-cab">
+        <h2 id="ola">Olá</h2>
+        <p>Saldos lidos agora, em paralelo, nos servidores da Europa, da América e de África.</p>
+      </header>
+      <div id="cartoes-contas" class="cartoes-contas"></div>
+      <div class="atalhos">
+        <button class="atalho" type="button" data-ir="transferir" data-modo="interna"><b>Transferir</b><span>para clientes do Global-Scale</span></button>
+        <button class="atalho" type="button" data-ir="transferir" data-modo="carteira"><b>Carteira móvel</b><span>M-Pesa, e-Mola ou mKesh</span></button>
+        <button class="atalho" type="button" data-ir="transferir" data-modo="banco"><b>Outro banco</b><span>transferência por IBAN</span></button>
+        <button class="atalho" type="button" data-ir="extrato"><b>Extrato</b><span>débitos, créditos e saldos</span></button>
+      </div>
+      <h2 class="titulo-sec">Últimos movimentos</h2>
+      <div id="ultimos"></div>
+    </section>
+
+    <!-- ===================================================== CLIENTE: TRANSFERIR -->
+    <section class="painel" id="sep-transferir" hidden>
+      <header class="painel-cab">
+        <h2>Transferir</h2>
+        <p>Escolha para onde vai o dinheiro. Antes de enviar, verá sempre um resumo para confirmar.</p>
+      </header>
+      <div class="segmentos" role="tablist" aria-label="Tipo de transferência">
+        <button type="button" role="tab" data-modo="interna" aria-selected="true">Cliente do Global-Scale</button>
+        <button type="button" role="tab" data-modo="carteira" aria-selected="false">Carteira móvel</button>
+        <button type="button" role="tab" data-modo="banco" aria-selected="false">Outro banco</button>
+      </div>
+
+      <form id="form-transf" class="folha" novalidate>
+        <div class="campos dois">
+          <label><span>De</span><select id="tr-origem" required></select></label>
+          <!-- destino: cliente do Global-Scale -->
+          <label data-modo="interna"><span>Para</span><select id="tr-destino"></select></label>
+          <!-- destino: carteira móvel -->
+          <div data-modo="carteira" class="destino-carteira">
+            <span class="rotulo">Operadora</span>
+            <div class="operadoras" id="operadoras" role="radiogroup" aria-label="Operadora">
+              <button type="button" role="radio" data-op="M-PESA" class="op mpesa" aria-checked="true">M-Pesa</button>
+              <button type="button" role="radio" data-op="E-MOLA" class="op emola" aria-checked="false">e-Mola</button>
+              <button type="button" role="radio" data-op="MKESH" class="op mkesh" aria-checked="false">mKesh</button>
+            </div>
+          </div>
+          <!-- destino: outro banco -->
+          <label data-modo="banco"><span>Banco de destino</span><select id="tr-banco">
+            <option value="BCI">BCI</option><option value="MILLENNIUM-BIM">Millennium bim</option>
+            <option value="STANDARD-BANK">Standard Bank</option><option value="ABSA">Absa</option>
+            <option value="MOZA">Moza Banco</option><option value="BANCO-PARCEIRO-MZ">Banco Parceiro</option>
+          </select></label>
+        </div>
+        <div class="campos dois" data-modo="carteira">
+          <label><span>Número de telemóvel</span>
+            <span class="com-prefixo"><b>+258</b><input id="tr-numero" inputmode="numeric" placeholder="84 123 4567" autocomplete="off"></span>
+          </label>
+          <div class="titular-carteira" id="tr-titular" aria-live="polite"><span class="nota">Escreva o número para confirmarmos o nome do titular.</span></div>
+        </div>
+        <div class="campos dois" data-modo="banco">
+          <label><span>IBAN do destinatário</span><input id="tr-iban" placeholder="MZ59 0001 0000 0012 3456 7890 1" autocomplete="off"></label>
+          <label><span>Nome do destinatário</span><input id="tr-nome-banco" placeholder="Como aparece na conta" autocomplete="off"></label>
+        </div>
+        <div class="campos dois">
+          <label><span>Montante</span>
+            <span class="com-moeda"><input id="tr-valor" inputmode="decimal" placeholder="0,00" required><b id="tr-moeda">€</b></span>
+          </label>
+          <div class="previsao" id="tr-previsao" aria-live="polite"></div>
+        </div>
+        <details class="avancado">
+          <summary>Modo de demonstração: simular uma falha nesta transferência</summary>
+          <div class="campos dois" data-modo="interna">
+            <label><span>Falha a simular</span><select id="tr-falha">
+              <option value="">Nenhuma (transferência normal)</option>
+              <option value="participante_indisponivel_fase1">Um servidor fica inacessível na fase 1</option>
+              <option value="atraso_fase2">O coordenador espera 20 s antes da fase 2</option>
+              <option value="crash_coordenador_fase2">O coordenador morre na fase 2 e reinicia</option>
+              <option value="crash_permanente_coordenador">O coordenador morre de vez na fase 2</option>
+            </select></label>
+            <label><span>Servidor que coordena</span><select id="tr-via">
+              <option value="">O que o gateway escolher</option>
+              <option value="api-1">api-1</option>
+              <option value="api-2">api-2</option>
+            </select></label>
+          </div>
+          <label class="marcar" data-modo="externo"><input type="checkbox" id="tr-legado-falha"> A rede interbancária está em baixo (o dinheiro é debitado e depois devolvido)</label>
+        </details>
+        <p class="erro-texto" id="tr-erro" aria-live="polite"></p>
+        <div class="rodape-form">
+          <p class="nota" id="tr-nota">Antes de enviar, verá um resumo para confirmar.</p>
+          <button class="acao" type="submit">Rever transferência</button>
+        </div>
+      </form>
+
+      <div id="confirmacao" class="confirmacao" hidden>
+        <h3>Confirme a transferência</h3>
+        <div class="resumo" id="resumo"></div>
+        <p class="nota" id="resumo-nota"></p>
+        <div class="rodape-form">
+          <button class="discreto" id="btn-voltar" type="button">Voltar e alterar</button>
+          <button class="acao" id="btn-confirmar" type="button">Confirmar e transferir</button>
+        </div>
+      </div>
+      <div id="res-transf" class="respostas"></div>
+    </section>
+
+    <!-- ===================================================== CLIENTE: EXTRATO -->
+    <section class="painel" id="sep-extrato" hidden>
+      <header class="painel-cab com-acao">
+        <div><h2>Extrato</h2><p>Débitos, créditos e o saldo depois de cada movimento.</p></div>
+        <div class="grupo-botoes sem-margem nao-imprimir">
+          <button class="discreto" id="btn-csv" type="button">Descarregar CSV</button>
+          <button class="discreto" id="btn-imprimir" type="button">Imprimir</button>
+        </div>
+      </header>
+      <form class="filtros nao-imprimir" id="form-extrato">
+        <label><span>Conta</span><select id="ex-conta"></select></label>
+        <label><span>Período</span><select id="ex-periodo">
+          <option value="30">Últimos 30 dias</option><option value="mes">Este mês</option>
+          <option value="7">Últimos 7 dias</option><option value="tudo" selected>Desde a abertura</option>
+          <option value="outro">Escolher datas…</option>
+        </select></label>
+        <label class="datas" data-datas><span>De</span><input type="date" id="ex-de"></label>
+        <label class="datas" data-datas><span>Até</span><input type="date" id="ex-ate"></label>
+      </form>
+      <div id="extrato"></div>
+    </section>
+
+    <!-- ===================================================== CLIENTE: ATAQUES -->
+    <section class="painel" id="sep-seguranca" hidden>
+      <header class="painel-cab">
+        <h2>Ataques</h2>
+        <p>Cada botão envia à API um pedido malicioso real, feito com a sua sessão. O resultado mostra a defesa que o travou.</p>
+      </header>
+      <div class="ataques" id="lista-ataques"></div>
+      <div id="res-seg" class="respostas"></div>
+    </section>
+
+    <!-- ===================================================== ADMIN: CENÁRIOS -->
+    <section class="painel" id="sep-cenarios" hidden>
+      <header class="painel-cab">
+        <h2>Cenários de falha</h2>
+        <p>Cada cenário derruba contentores reais, gera tráfego e confirma no fim que o dinheiro no sistema é o mesmo. Acompanhe no mapa.</p>
+        <p class="nota">O administrador não movimenta contas. As transferências dos cenários são feitas automaticamente por dois clientes de teste (Ana e Diego), como num teste automático.</p>
+      </header>
+      <div class="cenarios" id="lista-cenarios"></div>
+      <div class="diario">
+        <div class="diario-cab"><h3>Diário de execução</h3><button id="btn-limpar-exec" class="discreto" type="button">Limpar</button></div>
+        <ol class="exec" id="exec"><li class="vazio">Escolha um cenário para começar.</li></ol>
+      </div>
+    </section>
+
+    <!-- ===================================================== ADMIN: CLIENTES -->
+    <section class="painel" id="sep-clientes" hidden>
+      <header class="painel-cab com-acao">
+        <div><h2>Clientes e contas</h2>
+        <p>Os utilizadores vêm do serviço de autenticação; as contas, dos três fragmentos.</p></div>
+        <div class="grupo-botoes sem-margem">
+          <button id="btn-clientes" class="discreto" type="button">Atualizar</button>
+          <button id="btn-novo-cliente" class="acao" type="button">Novo cliente</button>
+        </div>
+      </header>
+      <form id="form-cliente" class="folha" hidden novalidate>
+        <h3>Novo cliente</h3>
+        <div class="campos dois">
+          <label><span>Nome completo</span><input id="nc-nome" placeholder="ex.: Marta Sitoe" autocomplete="off"></label>
+          <label><span>Utilizador (para entrar)</span><input id="nc-user" placeholder="ex.: marta" autocomplete="off" autocapitalize="none" spellcheck="false"></label>
+        </div>
+        <div class="campos dois">
+          <label><span>Palavra-passe inicial</span>
+            <span class="com-olho"><input id="nc-pass" autocomplete="new-password"><button type="button" id="btn-gerar" class="olho">Gerar</button></span>
+          </label>
+          <p class="nota alinhar-fundo">Mínimo 8 caracteres, com letras e números. Entregue-a ao cliente.</p>
+        </div>
+        <h3 class="sub-titulo">Primeira conta</h3>
+        <div class="campos tres">
+          <label><span>Região (servidor onde fica guardada)</span><select id="nc-regiao">
+            <option value="AF">África</option><option value="EU">Europa</option><option value="AM">América</option></select></label>
+          <label><span>Moeda</span><select id="nc-moeda">
+            <option value="MZN">Meticais (MT)</option><option value="EUR">Euros (€)</option>
+            <option value="USD">Dólares (US$)</option><option value="ZAR">Randes (R)</option></select></label>
+          <label><span>Depósito inicial (opcional)</span><input id="nc-deposito" inputmode="decimal" placeholder="0,00"></label>
+        </div>
+        <p class="erro-texto" id="nc-erro" aria-live="polite"></p>
+        <div class="rodape-form">
+          <button class="discreto" id="btn-cancelar-cliente" type="button">Cancelar</button>
+          <button class="acao" type="submit">Criar cliente</button>
+        </div>
+      </form>
+      <form id="form-conta" class="folha" hidden novalidate>
+        <h3 id="na-titulo">Abrir conta</h3>
+        <div class="campos dois">
+          <label><span>Região</span><select id="na-regiao">
+            <option value="AF">África</option><option value="EU">Europa</option><option value="AM">América</option></select></label>
+          <label><span>Moeda</span><select id="na-moeda">
+            <option value="MZN">Meticais (MT)</option><option value="EUR">Euros (€)</option>
+            <option value="USD">Dólares (US$)</option><option value="ZAR">Randes (R)</option></select></label>
+        </div>
+        <p class="erro-texto" id="na-erro"></p>
+        <div class="rodape-form">
+          <button class="discreto" id="btn-cancelar-conta" type="button">Cancelar</button>
+          <button class="acao" type="submit">Abrir conta</button>
+        </div>
+      </form>
+      <div id="res-clientes" class="respostas"></div>
+      <div class="barra-filtro">
+        <div class="segmentos" role="tablist" aria-label="Filtrar por região" id="filtro-regiao">
+          <button type="button" role="tab" data-reg="" aria-selected="true">Todas as regiões</button>
+          <button type="button" role="tab" data-reg="EU" aria-selected="false">Europa</button>
+          <button type="button" role="tab" data-reg="AM" aria-selected="false">América</button>
+          <button type="button" role="tab" data-reg="AF" aria-selected="false">África</button>
+        </div>
+        <span class="nota" id="filtro-resumo"></span>
+      </div>
+      <div id="lista-clientes"></div>
+    </section>
+
+    <!-- ===================================================== ADMIN: BASES DE DADOS -->
+    <section class="painel" id="sep-bd" hidden>
+      <header class="painel-cab com-acao">
+        <div><h2>Bases de dados</h2>
+        <p>Cada nó lido diretamente, um a um. Cada região guarda só as suas contas; a réplica tem de ser igual ao primário; a tabela de taxas é igual em todos. O Nó Central guarda uma cópia dos saldos e as operações que autorizou por uma região em baixo.</p></div>
+        <button id="btn-bd" class="discreto" type="button">Atualizar</button>
+      </header>
+      <div id="bd-resumo"></div>
+      <div id="bd-detalhe"></div>
+    </section>
+
+    <!-- ===================================================== ADMIN: DEPOSITAR -->
+    <section class="painel" id="sep-depositar" hidden>
+      <header class="painel-cab">
+        <h2>Depositar</h2>
+        <p>Regista dinheiro que entra no banco, por exemplo um depósito ao balcão. O administrador pode creditar contas, mas nunca as pode debitar.</p>
+      </header>
+      <form id="form-deposito" class="folha" novalidate>
+        <div class="campos dois">
+          <label><span>Conta do cliente</span><select id="dp-conta"></select></label>
+          <label><span>Descrição (aparece no extrato)</span><input id="dp-desc" value="Depósito em numerário"></label>
+        </div>
+        <div class="campos dois">
+          <label><span>Montante</span><span class="com-moeda"><input id="dp-valor" inputmode="decimal" placeholder="0,00"><b id="dp-moeda">MT</b></span></label>
+          <div class="previsao" id="dp-previsao"></div>
+        </div>
+        <p class="erro-texto" id="dp-erro" aria-live="polite"></p>
+        <div class="rodape-form">
+          <p class="nota">O depósito é uma transação local no servidor da conta e fica na auditoria.</p>
+          <button class="acao" type="submit">Depositar</button>
+        </div>
+      </form>
+      <div id="res-deposito" class="respostas"></div>
+    </section>
+
+    <!-- ===================================================== AMBOS: CÂMBIO -->
+    <section class="painel" id="sep-cambio" hidden>
+      <header class="painel-cab com-acao">
+        <div><h2>Câmbio</h2>
+        <p>A tabela de taxas existe em cada servidor de dados. As cópias têm de ser iguais; uma alteração só passa se todas a aceitarem.</p></div>
+        <button id="btn-taxas" class="discreto" type="button">Atualizar</button>
+      </header>
+      <div id="tabela-taxas"></div>
+      <form id="form-taxa" class="folha" data-papel="admin">
+        <h3>Alterar uma taxa</h3>
+        <div class="campos dois">
+          <label><span>Moeda</span><select id="tx-moeda"><option>EUR</option><option>USD</option></select></label>
+          <label><span>Meticais por unidade</span><input id="tx-valor" inputmode="decimal" value="69.50" required></label>
+        </div>
+        <div class="rodape-form">
+          <p class="nota">Feita com Two-Phase Commit em todas as cópias.</p>
+          <button class="acao" type="submit">Alterar em todas as cópias</button>
+        </div>
+      </form>
+      <div id="res-taxa" class="respostas"></div>
+    </section>
+
+    <!-- ===================================================== ADMIN: HDFS -->
+    <section class="painel" id="sep-dfs" hidden>
+      <header class="painel-cab">
+        <h2>Ficheiros no HDFS</h2>
+        <p>Relatórios e auditoria ficam no sistema de ficheiros distribuído, com cada bloco em dois DataNodes.</p>
+      </header>
+      <div class="grupo-botoes">
+        <button id="btn-rel-gerar" class="acao" type="button">Gerar relatório de saldos</button>
+        <button id="btn-rel-listar" class="discreto" type="button">Ver relatórios</button>
+        <button id="btn-aud" class="discreto" type="button">Ver auditoria</button>
+      </div>
+      <div id="lista-rel"></div>
+      <div id="lista-aud"></div>
+      <div id="res-dfs" class="respostas"></div>
+    </section>
+
+    <!-- ===================================================== ADMIN: COORDENADOR -->
+    <section class="painel" id="sep-admin" hidden>
+      <header class="painel-cab">
+        <h2>Coordenador 2PC</h2>
+        <p>Transações que cada servidor da API coordenou e as que ainda estão preparadas à espera de decisão.</p>
+      </header>
+      <div class="grupo-botoes">
+        <button id="btn-2pc" class="acao" type="button">Ver estado do coordenador</button>
+        <button id="btn-recuperar" class="discreto" type="button">Correr a recuperação agora</button>
+        <button id="btn-totais" class="discreto" type="button">Ver totais detalhados</button>
+      </div>
+      <div id="res-admin" class="respostas"></div>
+      <p class="nota">Depois de uma promoção de réplica, reponha a topologia inicial no terminal com <code>powershell -ExecutionPolicy Bypass -File scripts\reset-alta-disponibilidade.ps1</code>.</p>
+    </section>
+  </main>
+</div>
+
+<!-- ======================================================= LOGIN -->
+<dialog id="dlg-login" class="dialogo">
+  <form id="form-login" class="entrada" novalidate>
+    <svg class="selo-entrada" viewBox="0 0 40 40" aria-hidden="true">
+      <circle cx="20" cy="20" r="18" fill="none" stroke="currentColor" stroke-width="1.5"/>
+      <circle cx="20" cy="20" r="12.5" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="2 2.4"/>
+      <path d="M7 20h26M20 7c-6 7-6 19 0 26M20 7c6 7 6 19 0 26" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    </svg>
+    <h2>Entrar</h2>
+    <p class="nota">Use o seu utilizador e palavra-passe do Global-Scale System.</p>
+    <label><span>Utilizador</span><input id="login-user" autocomplete="username" autocapitalize="none" spellcheck="false" required></label>
+    <label><span>Palavra-passe</span>
+      <span class="com-olho"><input id="login-pass" type="password" autocomplete="current-password" required>
+      <button type="button" id="btn-olho" class="olho" aria-label="Mostrar a palavra-passe">Mostrar</button></span>
+    </label>
+    <div class="credenciais-demo">Utilizadores de demonstração:
+<button type="button" data-u="ana" data-p="Ana@2026">ana</button> (cliente),
+<button type="button" data-u="diego" data-p="Diego@2026">diego</button> (cliente),
+<button type="button" data-u="admin" data-p="Admin@2026">admin</button> (administrador).
+As palavras-passe estão no README: <code>Ana@2026</code>, <code>Diego@2026</code>, <code>Admin@2026</code>.</div>
+    <p class="erro-texto" id="login-erro" role="alert"></p>
+    <button class="acao largo" type="submit" id="btn-login">Entrar</button>
+    <button class="discreto largo" type="button" id="btn-fechar-login">Agora não, só ver o mapa</button>
+    <p class="nota pequena">A ligação é cifrada (HTTPS). A palavra-passe é verificada pelo serviço de autenticação, que devolve um token assinado válido 15 minutos.</p>
+  </form>
+</dialog>
+
+<!-- ======================================================= MENU DO NÓ -->
+<div id="menu-no" class="menu-no" hidden>
+  <h3 id="menu-no-nome"></h3>
+  <p id="menu-no-estado"></p>
+  <div id="menu-no-acoes" class="menu-no-acoes"></div>
+  <pre id="menu-no-log" class="log"></pre>
+</div>
+
+<script src="simulador.js"></script>
+<script src="app.js"></script>
+<script>document.querySelectorAll(".credenciais-demo [data-u]").forEach((b) => b.addEventListener("click", () => {
+  document.getElementById("login-user").value = b.dataset.u; document.getElementById("login-pass").value = b.dataset.p;
+  document.getElementById("login-pass").focus(); }));</script>
+</body>
+</html>

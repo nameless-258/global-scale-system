@@ -402,7 +402,7 @@ function animarCaminho(ids, cls, msPorSalto = 260) {
   return new Promise((resolve) => {
     const t0 = performance.now();
     function passo(t) {
-      const k = Math.min(1, (t - t0) / total);
+      const k = Math.max(0, Math.min(1, (t - t0) / total));   // o rAF pode dar um t ligeiramente anterior a t0
       const seg = Math.min(pts.length - 2, Math.floor(k * (pts.length - 1)));
       const f = k * (pts.length - 1) - seg;
       const [x1, y1] = pts[seg], [x2, y2] = pts[seg + 1];

@@ -2,6 +2,9 @@
 
 **Uma plataforma distribuída e resiliente para transações financeiras internacionais**
 
+> **Demonstração online:** https://nameless-258.github.io/global-scale-system/
+> É a mesma interface, com um simulador que corre no próprio browser (sem servidores). Serve para ver o sistema e experimentar os cenários de falha sem instalar nada; o sistema real corre com Docker, como descrito abaixo.
+
 Projeto prático do Exame Laboratorial da disciplina **Sistemas Distribuídos e Paralelos**
 (Licenciatura em Engenharia e Ciência dos Computadores — ISUTC).
 
@@ -182,6 +185,7 @@ docker compose exec db-america psql -U postgres -d banco -c "select gid, prepare
 ├── docker-compose.yml          Orquestração de todos os nós e da rede
 ├── nginx/nginx.conf            Gateway HTTPS, balanceamento e interface /ui/
 ├── ui/                         Interface gráfica (HTML, CSS e JavaScript, sem dependências externas)
+├── demo/                       Demonstração no GitHub Pages: a interface + simulador.js (sem servidores)
 ├── config/hadoop.env           Configuração do HDFS
 ├── db/                         Esquema das regiões e do Nó Central, TLS e pg_hba do PostgreSQL
 ├── services/
@@ -204,6 +208,7 @@ docker compose exec db-america psql -U postgres -d banco -c "select gid, prepare
 │   ├── testes.py               30 testes automáticos
 │   ├── verificar_bd.py         Lê cada nó da base de dados pela API
 │   ├── conectividade.py        Prova de conectividade entre os nós (DNS + TCP)
+│   ├── gerar-demo.py           Gera a demonstração para o GitHub Pages (pasta demo/)
 │   ├── reset-alta-disponibilidade.sh  Repõe primários e réplicas (.ps1 para PowerShell)
 │   └── demo.sh                 Guião da demonstração (17 passos)
 └── docs/arquitetura.(png|svg|dot)
